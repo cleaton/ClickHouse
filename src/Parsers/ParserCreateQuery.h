@@ -147,6 +147,8 @@ bool IParserColumnDeclaration<NameParser>::parseImpl(Pos & pos, ASTPtr & node, E
     ParserKeyword s_not{Keyword::NOT};
     ParserKeyword s_materialized{Keyword::MATERIALIZED};
     ParserKeyword s_ephemeral{Keyword::EPHEMERAL};
+    ParserKeyword s_proxy{Keyword::PROXY};
+    ParserKeyword s_element{Keyword::ELEMENT};
     ParserKeyword s_alias{Keyword::ALIAS};
     ParserKeyword s_auto_increment{Keyword::AUTO_INCREMENT};
     ParserKeyword s_comment{Keyword::COMMENT};
@@ -204,6 +206,7 @@ bool IParserColumnDeclaration<NameParser>::parseImpl(Pos & pos, ASTPtr & node, E
     std::optional<bool> null_modifier;
     bool ephemeral_default = false;
     ASTPtr default_expression;
+    ASTPtr proxy_element_expression;
     ASTPtr comment_expression;
     ASTPtr codec_expression;
     ASTPtr statistics_desc_expression;
@@ -231,6 +234,7 @@ bool IParserColumnDeclaration<NameParser>::parseImpl(Pos & pos, ASTPtr & node, E
         && !s_default.checkWithoutMoving(pos, expected)
         && !s_materialized.checkWithoutMoving(pos, expected)
         && !s_ephemeral.checkWithoutMoving(pos, expected)
+        && !s_proxy.checkWithoutMoving(pos, expected)
         && !s_alias.checkWithoutMoving(pos, expected)
         && !s_auto_increment.checkWithoutMoving(pos, expected)
         && !s_primary_key.checkWithoutMoving(pos, expected)
@@ -308,6 +312,19 @@ bool IParserColumnDeclaration<NameParser>::parseImpl(Pos & pos, ASTPtr & node, E
 
         if (!default_expression && !type)
             return false;
+    }
+    else if (s_proxy.ignore(pos, expected))
+    {
+        default_specifier = ColumnDefaultSpecifier::Proxy;
+
+        if (!expr_parser.parse(pos, default_expression, expected))
+            return false;
+
+        if (s_element.ignore(pos, expected))
+        {
+            if (!expr_parser.parse(pos, proxy_element_expression, expected))
+                return false;
+        }
     }
     else if (s_auto_increment.ignore(pos, expected))
     {
@@ -418,6 +435,9 @@ bool IParserColumnDeclaration<NameParser>::parseImpl(Pos & pos, ASTPtr & node, E
 
     if (settings)
         column_declaration->setSettings(std::move(settings));
+
+    if (proxy_element_expression)
+        column_declaration->setProxyElementExpression(std::move(proxy_element_expression));
 
     if (statistics_desc_expression)
         column_declaration->setStatisticsDesc(std::move(statistics_desc_expression));

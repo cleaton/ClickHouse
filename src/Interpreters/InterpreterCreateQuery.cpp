@@ -468,6 +468,8 @@ ASTPtr InterpreterCreateQuery::formatColumns(const ColumnsDescription & columns)
         {
             column_declaration->default_specifier = toColumnDefaultSpecifier(column.default_desc.kind);
             column_declaration->setDefaultExpression(column.default_desc.expression->clone());
+            if (column.default_desc.proxy_element_expression)
+                column_declaration->setProxyElementExpression(column.default_desc.proxy_element_expression->clone());
         }
 
         column_declaration->ephemeral_default = column.default_desc.ephemeral_default;
@@ -589,6 +591,7 @@ ColumnsDescription InterpreterCreateQuery::getColumnsDescription(
 
     DefaultExpressionsInfo default_expr_info{make_intrusive<ASTExpressionList>()};
     NamesAndTypesList column_names_and_types;
+    NameSet proxy_column_names;
     bool make_columns_nullable = mode <= LoadingStrictnessLevel::SECONDARY_CREATE && !is_restore_from_backup
         && context_->getSettingsRef()[Setting::data_type_default_nullable];
 
@@ -605,8 +608,16 @@ ColumnsDescription InterpreterCreateQuery::getColumnsDescription(
 
         column_names_and_types.emplace_back(col_decl.name, getColumnType(col_decl, mode, make_columns_nullable));
 
-        /// add column to postprocessing if there is a default_expression specified
-        getDefaultExpressionInfoInto(col_decl, column_names_and_types.back().type, default_expr_info);
+        if (col_decl.default_specifier == ColumnDefaultSpecifier::Proxy)
+        {
+            proxy_column_names.insert(col_decl.name);
+            /// PROXY body is a macro, not evaluated at CREATE; skip adding to default_expr_info so it is not type-checked.
+        }
+        else
+        {
+            /// add column to postprocessing if there is a default_expression specified
+            getDefaultExpressionInfoInto(col_decl, column_names_and_types.back().type, default_expr_info);
+        }
     }
 
     Block defaults_sample_block;
@@ -617,7 +628,7 @@ ColumnsDescription InterpreterCreateQuery::getColumnsDescription(
     if (!default_expr_info.expr_list->children.empty()
         && (default_expr_info.has_columns_with_default_without_type || (mode <= LoadingStrictnessLevel::CREATE)))
     {
-        defaults_sample_block = validateColumnsDefaultsAndGetSampleBlock(default_expr_info.expr_list, column_names_and_types, context_);
+        defaults_sample_block = validateColumnsDefaultsAndGetSampleBlock(default_expr_info.expr_list, column_names_and_types, context_, proxy_column_names);
     }
 
     bool skip_checks = LoadingStrictnessLevel::SECONDARY_CREATE <= mode;
@@ -647,8 +658,6 @@ ColumnsDescription InterpreterCreateQuery::getColumnsDescription(
         {
             if (context_->hasQueryContext() && context_->getQueryContext().get() == context_.get())
             {
-                /// Normalize query only for original CREATE query, not on metadata loading.
-                /// And for CREATE query we can pass local context, because result will not change after restart.
                 NormalizeAndEvaluateConstantsVisitor::Data visitor_data{context_};
                 NormalizeAndEvaluateConstantsVisitor visitor(visitor_data);
                 visitor.visit(default_expression);
@@ -658,10 +667,13 @@ ColumnsDescription InterpreterCreateQuery::getColumnsDescription(
 
             if (col_decl.getType())
                 column.type = name_type_it->type;
+            else if (col_decl.default_specifier == ColumnDefaultSpecifier::Proxy)
+            {
+                throw Exception(ErrorCodes::BAD_ARGUMENTS, "Type is required for PROXY column {}", column.name);
+            }
             else
             {
                 column.type = defaults_sample_block.getByName(column.name).type;
-                /// set nullability for case of column declaration w/o type but with default expression
                 if ((col_decl.null_modifier && *col_decl.null_modifier) || make_columns_nullable)
                     column.type = makeNullable(column.type);
             }
@@ -669,6 +681,8 @@ ColumnsDescription InterpreterCreateQuery::getColumnsDescription(
             column.default_desc.kind = toColumnDefaultKind(col_decl.default_specifier);
             column.default_desc.expression = default_expr;
             column.default_desc.ephemeral_default = col_decl.ephemeral_default;
+            if (auto proxy_element_expression = col_decl.getProxyElementExpression())
+                column.default_desc.proxy_element_expression = proxy_element_expression->clone();
         }
         else if (col_decl.getType())
             column.type = name_type_it->type;

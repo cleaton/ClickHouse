@@ -14,7 +14,8 @@ enum class ColumnDefaultKind : uint8_t
     Default,
     Materialized,
     Alias,
-    Ephemeral
+    Ephemeral,
+    Proxy
 };
 
 
@@ -32,6 +33,7 @@ struct ColumnDefault
 
     ColumnDefaultKind kind = ColumnDefaultKind::Default;
     ASTPtr expression;
+    ASTPtr proxy_element_expression;
     bool ephemeral_default = false;
 };
 

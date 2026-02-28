@@ -35,12 +35,14 @@
 
 #include <Common/FieldVisitorToString.h>
 #include <Common/quoteString.h>
+#include <Core/Field.h>
 #include <Core/Settings.h>
 
 #include <DataTypes/DataTypesNumber.h>
 #include <DataTypes/DataTypeTuple.h>
 #include <DataTypes/DataTypeArray.h>
 #include <DataTypes/DataTypeMap.h>
+#include <DataTypes/DataTypeNullable.h>
 #include <DataTypes/getLeastSupertype.h>
 
 #include <Functions/FunctionFactory.h>
@@ -109,6 +111,50 @@ namespace ErrorCodes
     extern const int NUMBER_OF_COLUMNS_DOESNT_MATCH;
     extern const int UNEXPECTED_EXPRESSION;
     extern const int SYNTAX_ERROR;
+}
+
+namespace
+{
+
+QueryTreeNodePtr substituteIdentifierInTree(const QueryTreeNodePtr & node, const String & param_name, const QueryTreeNodePtr & value_node)
+{
+    const auto * identifier_node = node->as<IdentifierNode>();
+    if (identifier_node && identifier_node->getIdentifier().getFullName() == param_name)
+        return value_node->clone();
+
+    if (const auto * lambda_node = node->as<LambdaNode>())
+    {
+        auto lambda_clone = node->clone();
+        for (const auto & lambda_argument_name : lambda_node->getArgumentNames())
+        {
+            if (lambda_argument_name == param_name)
+                return lambda_clone;
+        }
+
+        auto & lambda_clone_typed = lambda_clone->as<LambdaNode &>();
+        lambda_clone_typed.getExpression() = substituteIdentifierInTree(lambda_clone_typed.getExpression(), param_name, value_node);
+        return lambda_clone;
+    }
+
+    auto clone = node->clone();
+    for (auto & child : clone->getChildren())
+    {
+        if (child)
+            child = substituteIdentifierInTree(child, param_name, value_node);
+    }
+    return clone;
+}
+
+}
+
+QueryTreeNodePtr QueryAnalyzer::expandProxyElement(const LambdaNodePtr & lambda_node, const QueryTreeNodePtr & value_node)
+{
+    const auto & param_names = lambda_node->getArgumentNames();
+    if (param_names.empty())
+        return lambda_node->getExpression()->clone();
+
+    String param_name = param_names[0];
+    return substituteIdentifierInTree(lambda_node->getExpression(), param_name, value_node);
 }
 
 QueryAnalyzer::QueryAnalyzer(bool only_analyze_)
@@ -1481,7 +1527,7 @@ GetColumnsOptions QueryAnalyzer::buildGetColumnsOptions(QueryTreeNodePtr & match
 
     if (matcher_node_typed.isAsteriskMatcher())
     {
-        get_columns_options_kind = GetColumnsOptions::Ordinary;
+        get_columns_options_kind = GetColumnsOptions::Ordinary | GetColumnsOptions::Proxy;
 
         const auto & settings = context->getSettingsRef();
 
@@ -3660,6 +3706,13 @@ void QueryAnalyzer::initializeTableExpressionData(const QueryTreeNodePtr & table
             {
                 auto alias_expression = buildQueryTree(column_default->expression, scope.context);
                 auto column_node = std::make_shared<ColumnNode>(column_name_and_type, std::move(alias_expression), table_expression_node);
+                column_name_to_column_node.emplace(column_name_and_type.name, column_node);
+                alias_columns_to_resolve.emplace_back(column_name_and_type.name, column_node);
+            }
+            else if (column_default && column_default->kind == ColumnDefaultKind::Proxy)
+            {
+                auto proxy_expression = buildQueryTree(column_default->expression, scope.context);
+                auto column_node = std::make_shared<ColumnNode>(column_name_and_type, std::move(proxy_expression), table_expression_node);
                 column_name_to_column_node.emplace(column_name_and_type.name, column_node);
                 alias_columns_to_resolve.emplace_back(column_name_and_type.name, column_node);
             }

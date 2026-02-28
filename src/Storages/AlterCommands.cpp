@@ -1488,6 +1488,9 @@ void AlterCommands::validate(const StoragePtr & table, ContextPtr context) const
             auto column_default = all_columns.getDefault(column_name);
             if (column_default)
             {
+                if (column_default->kind == ColumnDefaultKind::Proxy)
+                    throw Exception(ErrorCodes::NOT_IMPLEMENTED, "ALTER of PROXY columns is not supported");
+
                 if (command.to_remove == AlterCommand::RemoveProperty::DEFAULT && column_default->kind != ColumnDefaultKind::Default)
                 {
                     throw Exception(

@@ -10,6 +10,7 @@ struct AliasNames
     static constexpr const char * MATERIALIZED = "MATERIALIZED";
     static constexpr const char * ALIAS = "ALIAS";
     static constexpr const char * EPHEMERAL = "EPHEMERAL";
+    static constexpr const char * PROXY = "PROXY";
 };
 
 }
@@ -29,7 +30,8 @@ ColumnDefaultKind columnDefaultKindFromString(const std::string & str)
         { AliasNames::DEFAULT, ColumnDefaultKind::Default },
         { AliasNames::MATERIALIZED, ColumnDefaultKind::Materialized },
         { AliasNames::ALIAS, ColumnDefaultKind::Alias },
-        { AliasNames::EPHEMERAL, ColumnDefaultKind::Ephemeral }
+        { AliasNames::EPHEMERAL, ColumnDefaultKind::Ephemeral },
+        { AliasNames::PROXY, ColumnDefaultKind::Proxy }
     };
 
     const auto it = map.find(str);
@@ -46,7 +48,8 @@ std::string toString(const ColumnDefaultKind kind)
         { ColumnDefaultKind::Default, AliasNames::DEFAULT },
         { ColumnDefaultKind::Materialized, AliasNames::MATERIALIZED },
         { ColumnDefaultKind::Alias, AliasNames::ALIAS },
-        { ColumnDefaultKind::Ephemeral, AliasNames::EPHEMERAL }
+        { ColumnDefaultKind::Ephemeral, AliasNames::EPHEMERAL },
+        { ColumnDefaultKind::Proxy, AliasNames::PROXY }
     };
 
     const auto it = map.find(kind);
@@ -63,6 +66,7 @@ ColumnDefault & ColumnDefault::operator=(const ColumnDefault & other)
 
     kind = other.kind;
     expression = other.expression ? other.expression->clone() : nullptr;
+    proxy_element_expression = other.proxy_element_expression ? other.proxy_element_expression->clone() : nullptr;
     ephemeral_default = other.ephemeral_default;
 
     return *this;
@@ -75,6 +79,7 @@ ColumnDefault & ColumnDefault::operator=(ColumnDefault && other) noexcept
 
     kind = std::exchange(other.kind, ColumnDefaultKind{});
     expression = std::exchange(other.expression, nullptr);
+    proxy_element_expression = std::exchange(other.proxy_element_expression, nullptr);
     ephemeral_default = std::exchange(other.ephemeral_default, false);
 
     return *this;
@@ -83,7 +88,8 @@ ColumnDefault & ColumnDefault::operator=(ColumnDefault && other) noexcept
 bool operator==(const ColumnDefault & lhs, const ColumnDefault & rhs)
 {
     auto expression_str = [](const ASTPtr & expr) { return expr ? expr->formatWithSecretsOneLine() : String(); };
-    return lhs.kind == rhs.kind && expression_str(lhs.expression) == expression_str(rhs.expression);
+    return lhs.kind == rhs.kind && expression_str(lhs.expression) == expression_str(rhs.expression)
+        && expression_str(lhs.proxy_element_expression) == expression_str(rhs.proxy_element_expression);
 }
 
 }

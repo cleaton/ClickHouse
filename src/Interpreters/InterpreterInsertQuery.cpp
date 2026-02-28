@@ -48,6 +48,7 @@
 #include <QueryPipeline/RemoteQueryExecutor.h>
 #include <Processors/Sources/RemoteSource.h>
 #include <Storages/IStorageCluster.h>
+#include <Storages/ColumnsDescription.h>
 #include <Interpreters/JoinedTables.h>
 
 #include <memory>
@@ -262,6 +263,10 @@ Block InterpreterInsertQuery::getSampleBlock(
                 if (!allow_materialized)
                     throw Exception(ErrorCodes::ILLEGAL_COLUMN, "Cannot insert column {}, because it is MATERIALIZED column", current_name);
                 res[pos] = table_sample_physical.getByName(current_name);
+            }
+            else if (metadata_snapshot->getColumns().hasProxy(current_name))
+            {
+                throw Exception(ErrorCodes::ILLEGAL_COLUMN, "Cannot insert column {}, because it is PROXY column", current_name);
             }
             else if (table_sample_virtuals.has(current_name))
             {

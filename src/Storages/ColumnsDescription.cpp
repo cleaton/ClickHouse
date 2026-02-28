@@ -164,7 +164,10 @@ void ColumnDescription::writeText(WriteBuffer & buf, IAST::FormatState & state, 
         writeChar('\t', buf);
         DB::writeText(DB::toString(default_desc.kind), buf);
         writeChar('\t', buf);
-        writeEscapedString(formatASTStateAware(*default_desc.expression, state), buf);
+        String expr_str = formatASTStateAware(*default_desc.expression, state);
+        if (default_desc.proxy_element_expression)
+            expr_str += " ELEMENT " + formatASTStateAware(*default_desc.proxy_element_expression, state);
+        writeEscapedString(expr_str, buf);
     }
 
     if (!comment.empty() && include_comment)
@@ -233,6 +236,8 @@ void ColumnDescription::readText(ReadBuffer & buf)
                 default_desc.kind = toColumnDefaultKind(col_ast->default_specifier);
                 default_desc.expression = std::move(col_default_expression);
                 default_desc.ephemeral_default = col_ast->ephemeral_default;
+                if (auto proxy_element_expression = col_ast->getProxyElementExpression())
+                    default_desc.proxy_element_expression = std::move(proxy_element_expression);
             }
 
             if (auto col_comment = col_ast->getComment())
@@ -521,6 +526,15 @@ NamesAndTypesList ColumnsDescription::getEphemeral() const
     return ret;
 }
 
+NamesAndTypesList ColumnsDescription::getProxy() const
+{
+    NamesAndTypesList ret;
+    for (const auto & col : columns)
+        if (col.default_desc.kind == ColumnDefaultKind::Proxy)
+            ret.emplace_back(col.name, col.type);
+    return ret;
+}
+
 NamesAndTypesList ColumnsDescription::getAll() const
 {
     NamesAndTypesList ret;
@@ -566,55 +580,46 @@ void ColumnsDescription::addSubcolumnsToList(NamesAndTypesList & source_list) co
 NamesAndTypesList ColumnsDescription::get(const GetColumnsOptions & options) const
 {
     NamesAndTypesList res;
-    switch (options.kind)
+
+    if (options.kind == GetColumnsOptions::All)
     {
-        case GetColumnsOptions::None:
+        res = getAll();
+    }
+    else if (options.kind == GetColumnsOptions::AllPhysical || options.kind == GetColumnsOptions::AllPhysicalAndAliases)
+    {
+        res = getAllPhysical();
+        if (options.kind == GetColumnsOptions::AllPhysicalAndAliases)
         {
-            break;
-        }
-        case GetColumnsOptions::All:
-        {
-            res = getAll();
-            break;
-        }
-        case GetColumnsOptions::AllPhysicalAndAliases:
-        {
-            res = getAllPhysical();
             auto aliases = getAliases();
             res.insert(res.end(), aliases.begin(), aliases.end());
-            break;
         }
-        case GetColumnsOptions::AllPhysical:
+    }
+    else
+    {
+        if (options.kind & GetColumnsOptions::Ordinary)
         {
-            res = getAllPhysical();
-            break;
+            auto cols = getOrdinary();
+            res.insert(res.end(), cols.begin(), cols.end());
         }
-        case GetColumnsOptions::OrdinaryAndAliases:
+        if (options.kind & GetColumnsOptions::Materialized)
         {
-            res = getOrdinary();
-            auto aliases = getAliases();
-            res.insert(res.end(), aliases.begin(), aliases.end());
-            break;
+            auto cols = getMaterialized();
+            res.insert(res.end(), cols.begin(), cols.end());
         }
-        case GetColumnsOptions::Ordinary:
+        if (options.kind & GetColumnsOptions::Aliases)
         {
-            res = getOrdinary();
-            break;
+            auto cols = getAliases();
+            res.insert(res.end(), cols.begin(), cols.end());
         }
-        case GetColumnsOptions::Materialized:
+        if (options.kind & GetColumnsOptions::Ephemeral)
         {
-            res = getMaterialized();
-            break;
+            auto cols = getEphemeral();
+            res.insert(res.end(), cols.begin(), cols.end());
         }
-        case GetColumnsOptions::Aliases:
+        if (options.kind & GetColumnsOptions::Proxy)
         {
-            res = getAliases();
-            break;
-        }
-        case GetColumnsOptions::Ephemeral:
-        {
-            res = getEphemeral();
-            break;
+            auto cols = getProxy();
+            res.insert(res.end(), cols.begin(), cols.end());
         }
     }
 
@@ -674,6 +679,8 @@ static GetColumnsOptions::Kind defaultKindToGetKind(ColumnDefaultKind kind)
             return GetColumnsOptions::Aliases;
         case ColumnDefaultKind::Ephemeral:
             return GetColumnsOptions::Ephemeral;
+        case ColumnDefaultKind::Proxy:
+            return GetColumnsOptions::Proxy;
     }
 
     return GetColumnsOptions::None;
@@ -692,7 +699,7 @@ NamesAndTypesList ColumnsDescription::getAllPhysical() const
 {
     NamesAndTypesList ret;
     for (const auto & col : columns)
-        if (col.default_desc.kind != ColumnDefaultKind::Alias && col.default_desc.kind != ColumnDefaultKind::Ephemeral)
+        if (col.default_desc.kind != ColumnDefaultKind::Alias && col.default_desc.kind != ColumnDefaultKind::Ephemeral && col.default_desc.kind != ColumnDefaultKind::Proxy)
             ret.emplace_back(col.name, col.type);
     return ret;
 }
@@ -701,7 +708,7 @@ Names ColumnsDescription::getNamesOfPhysical() const
 {
     Names ret;
     for (const auto & col : columns)
-        if (col.default_desc.kind != ColumnDefaultKind::Alias && col.default_desc.kind != ColumnDefaultKind::Ephemeral)
+        if (col.default_desc.kind != ColumnDefaultKind::Alias && col.default_desc.kind != ColumnDefaultKind::Ephemeral && col.default_desc.kind != ColumnDefaultKind::Proxy)
             ret.emplace_back(col.name);
     return ret;
 }
@@ -807,7 +814,7 @@ bool ColumnsDescription::hasPhysical(const String & column_name) const
 {
     auto it = columns.get<1>().find(column_name);
     return it != columns.get<1>().end() &&
-        it->default_desc.kind != ColumnDefaultKind::Alias && it->default_desc.kind != ColumnDefaultKind::Ephemeral;
+        it->default_desc.kind != ColumnDefaultKind::Alias && it->default_desc.kind != ColumnDefaultKind::Ephemeral && it->default_desc.kind != ColumnDefaultKind::Proxy;
 }
 
 bool ColumnsDescription::hasNotAlias(const String & column_name) const
@@ -820,6 +827,12 @@ bool ColumnsDescription::hasAlias(const String & column_name) const
 {
     auto it = columns.get<1>().find(column_name);
     return it != columns.get<1>().end() && it->default_desc.kind == ColumnDefaultKind::Alias;
+}
+
+bool ColumnsDescription::hasProxy(const String & column_name) const
+{
+    auto it = columns.get<1>().find(column_name);
+    return it != columns.get<1>().end() && it->default_desc.kind == ColumnDefaultKind::Proxy;
 }
 
 bool ColumnsDescription::hasColumnOrSubcolumn(GetColumnsOptions::Kind kind, const String & column_name) const
@@ -1117,7 +1130,8 @@ void collectAliasDependenciesFromAST(
  */
 void detectRecursiveDefaultCycles(
     const ASTPtr & expression_list,
-    const NameSet & default_column_names)
+    const NameSet & default_column_names,
+    const NameSet & proxy_column_names)
 {
     if (!expression_list || default_column_names.empty())
         return;
@@ -1179,7 +1193,11 @@ void detectRecursiveDefaultCycles(
         dfs_stack.push_back(vertex);
 
         NameSet dependencies;
-        if (auto it = alias_to_expression.find(vertex); it != alias_to_expression.end())
+        if (proxy_column_names.contains(vertex))
+        {
+            /// PROXY body is a macro, not evaluated at insert; do not add dependencies for cycle check.
+        }
+        else if (auto it = alias_to_expression.find(vertex); it != alias_to_expression.end())
         {
             collectAliasDependenciesFromAST(it->second, alias_names, dependencies);
             for (const auto & dependency : dependencies)
@@ -1200,7 +1218,7 @@ void detectRecursiveDefaultCycles(
     }
 }
 
-std::optional<Block> validateDefaultsWithAnalyzer(ASTPtr default_expr_list, const NamesAndTypesList & all_columns, ContextPtr context, bool get_sample_block)
+std::optional<Block> validateDefaultsWithAnalyzer(ASTPtr default_expr_list, const NamesAndTypesList & all_columns, ContextPtr context, bool get_sample_block, const NameSet & proxy_column_names)
 {
     if (!default_expr_list || default_expr_list->children.empty())
     {
@@ -1229,7 +1247,7 @@ std::optional<Block> validateDefaultsWithAnalyzer(ASTPtr default_expr_list, cons
             default_column_names.insert(alias);
     }
 
-    detectRecursiveDefaultCycles(default_expr_list, default_column_names);
+    detectRecursiveDefaultCycles(default_expr_list, default_column_names, proxy_column_names);
 
     ColumnsDescription fake_column_descriptions(all_columns);
     auto storage = std::make_shared<StorageDummy>(StorageID{"dummy", "dummy"}, fake_column_descriptions);
@@ -1293,7 +1311,7 @@ std::optional<Block> validateDefaultsWithAnalyzer(ASTPtr default_expr_list, cons
     return result_block;
 }
 
-std::optional<Block> validateColumnsDefaultsAndGetSampleBlockImpl(ASTPtr default_expr_list, const NamesAndTypesList & all_columns, ContextPtr context, bool get_sample_block)
+std::optional<Block> validateColumnsDefaultsAndGetSampleBlockImpl(ASTPtr default_expr_list, const NamesAndTypesList & all_columns, ContextPtr context, bool get_sample_block, const NameSet & proxy_column_names)
 {
     if (!default_expr_list || default_expr_list->children.empty())
     {
@@ -1309,7 +1327,7 @@ std::optional<Block> validateColumnsDefaultsAndGetSampleBlockImpl(ASTPtr default
     try
     {
         if (context->getSettingsRef()[Setting::allow_experimental_analyzer])
-            return validateDefaultsWithAnalyzer(default_expr_list, all_columns, context, get_sample_block);
+            return validateDefaultsWithAnalyzer(default_expr_list, all_columns, context, get_sample_block, proxy_column_names);
         else
         {
             auto syntax_analyzer_result = TreeRewriter(context).analyze(default_expr_list, all_columns, {}, {}, false, /* allow_self_aliases = */ false);
@@ -1332,15 +1350,15 @@ std::optional<Block> validateColumnsDefaultsAndGetSampleBlockImpl(ASTPtr default
 }
 }
 
-void validateColumnsDefaults(ASTPtr default_expr_list, const NamesAndTypesList & all_columns, ContextPtr context)
+void validateColumnsDefaults(ASTPtr default_expr_list, const NamesAndTypesList & all_columns, ContextPtr context, const NameSet & proxy_column_names)
 {
     /// Do not execute the default expressions as they might be heavy, e.g.: access remote servers, etc.
-    validateColumnsDefaultsAndGetSampleBlockImpl(default_expr_list, all_columns, context, /*get_sample_block=*/false);
+    validateColumnsDefaultsAndGetSampleBlockImpl(default_expr_list, all_columns, context, /*get_sample_block=*/false, proxy_column_names);
 }
 
-Block validateColumnsDefaultsAndGetSampleBlock(ASTPtr default_expr_list, const NamesAndTypesList & all_columns, ContextPtr context)
+Block validateColumnsDefaultsAndGetSampleBlock(ASTPtr default_expr_list, const NamesAndTypesList & all_columns, ContextPtr context, const NameSet & proxy_column_names)
 {
-    auto result = validateColumnsDefaultsAndGetSampleBlockImpl(default_expr_list, all_columns, context, /*get_sample_block=*/true);
+    auto result = validateColumnsDefaultsAndGetSampleBlockImpl(default_expr_list, all_columns, context, /*get_sample_block=*/true, proxy_column_names);
     chassert(result.has_value());
     return std::move(*result);
 }

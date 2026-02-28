@@ -5,6 +5,7 @@
 #include <Interpreters/Context_fwd.h>
 #include <Analyzer/HashUtils.h>
 #include <Analyzer/IQueryTreeNode.h>
+#include <Analyzer/LambdaNode.h>
 #include <Analyzer/Resolve/IdentifierLookup.h>
 #include <Analyzer/Resolve/IdentifierResolver.h>
 
@@ -239,6 +240,8 @@ private:
         const QueryTreeNodePtr & lambda_node_to_resolve,
         const QueryTreeNodes & lambda_arguments,
         IdentifierResolveScope & scope);
+
+    static QueryTreeNodePtr expandProxyElement(const LambdaNodePtr & lambda_node, const QueryTreeNodePtr & value_node);
 
     ProjectionNames resolveFunction(QueryTreeNodePtr & function_node, IdentifierResolveScope & scope);
 

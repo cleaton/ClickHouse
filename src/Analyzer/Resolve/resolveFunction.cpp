@@ -1,6 +1,7 @@
 #include <Analyzer/Resolve/QueryAnalyzer.h>
 #include <Analyzer/Resolve/IdentifierResolveScope.h>
 
+#include <Analyzer/ColumnNode.h>
 #include <Analyzer/ConstantNode.h>
 #include <Analyzer/IdentifierNode.h>
 #include <Analyzer/JoinNode.h>
@@ -9,6 +10,7 @@
 #include <Analyzer/TableNode.h>
 #include <Analyzer/TableFunctionNode.h>
 #include <Analyzer/QueryNode.h>
+#include <Analyzer/QueryTreeBuilder.h>
 #include <Analyzer/UnionNode.h>
 #include <Analyzer/WindowNode.h>
 
@@ -19,6 +21,7 @@
 
 #include <AggregateFunctions/Combinators/AggregateFunctionCombinatorFactory.h>
 
+#include <Core/Field.h>
 #include <Core/Settings.h>
 #include <DataTypes/DataTypesNumber.h>
 #include <DataTypes/DataTypeNullable.h>
@@ -89,6 +92,92 @@ void checkFunctionNodeHasEmptyNullsAction(FunctionNode const & node)
             "Function with name {} cannot use {} NULLS",
             backQuote(node.getFunctionName()),
             node.getNullsAction() == NullsAction::IGNORE_NULLS ? "IGNORE" : "RESPECT");
+}
+
+bool simplifyProxyElementExpression(QueryTreeNodePtr & node)
+{
+    auto try_get_integer_constant = [](const QueryTreeNodePtr & constant_node) -> std::optional<Int64>
+    {
+        const auto * typed_constant = constant_node->as<ConstantNode>();
+        if (!typed_constant)
+            return {};
+
+        const auto & value = typed_constant->getValue();
+        if (value.getType() == Field::Types::UInt64)
+            return static_cast<Int64>(value.safeGet<UInt64>());
+        if (value.getType() == Field::Types::Int64)
+            return value.safeGet<Int64>();
+
+        return {};
+    };
+
+    auto try_get_bool_constant = [](const QueryTreeNodePtr & constant_node) -> std::optional<bool>
+    {
+        const auto * typed_constant = constant_node->as<ConstantNode>();
+        if (!typed_constant)
+            return {};
+
+        const auto & value = typed_constant->getValue();
+        if (value.getType() == Field::Types::UInt64)
+            return value.safeGet<UInt64>() != 0;
+        if (value.getType() == Field::Types::Int64)
+            return value.safeGet<Int64>() != 0;
+
+        return {};
+    };
+
+    std::function<bool(QueryTreeNodePtr &)> simplify_proxy_expression = [&](QueryTreeNodePtr & current_node) -> bool
+    {
+        auto * function = current_node->as<FunctionNode>();
+        if (!function)
+            return false;
+
+        bool changed = false;
+        auto & function_arguments = function->getArguments().getNodes();
+        for (auto & function_argument : function_arguments)
+            changed |= simplify_proxy_expression(function_argument);
+
+        if (function->getFunctionName() == "arrayElement" && function_arguments.size() == 2)
+        {
+            auto * array_function = function_arguments[0]->as<FunctionNode>();
+            if (array_function && array_function->getFunctionName() == "array")
+            {
+                auto index_opt = try_get_integer_constant(function_arguments[1]);
+                if (index_opt)
+                {
+                    auto & array_arguments = array_function->getArguments().getNodes();
+                    Int64 index = *index_opt;
+                    if (index > 0 && static_cast<size_t>(index) <= array_arguments.size())
+                    {
+                        current_node = array_arguments[static_cast<size_t>(index) - 1];
+                        changed = true;
+                    }
+                }
+            }
+        }
+        else if (function->getFunctionName() == "if" && function_arguments.size() == 3)
+        {
+            auto condition_opt = try_get_bool_constant(function_arguments[0]);
+            if (condition_opt)
+            {
+                current_node = function_arguments[*condition_opt ? 1 : 2];
+                changed = true;
+            }
+        }
+
+        return changed;
+    };
+
+    bool changed = false;
+    constexpr size_t max_simplification_passes = 8;
+    for (size_t pass = 0; pass < max_simplification_passes; ++pass)
+    {
+        if (!simplify_proxy_expression(node))
+            break;
+        changed = true;
+    }
+
+    return changed;
 }
 }
 
@@ -759,6 +848,50 @@ ProjectionNames QueryAnalyzer::resolveFunction(QueryTreeNodePtr & node, Identifi
     }
 
     auto & function_node = *function_node_ptr;
+
+    /// Expand PROXY column on arrayElement(proxy_col, key): substitute key
+    if (function_name == "arrayElement")
+    {
+        const auto & args = function_node.getArguments().getNodes();
+        if (args.size() == 2)
+        {
+            const auto * col_node = args[0]->as<ColumnNode>();
+            if (col_node)
+            {
+                auto col_source = col_node->getColumnSourceOrNull();
+                if (col_source)
+                {
+                    StorageSnapshotPtr storage_snapshot;
+                    if (auto * table_node = col_source->as<TableNode>())
+                        storage_snapshot = table_node->getStorageSnapshot();
+                    /// For non-table sources keep regular arrayElement semantics.
+
+                    if (storage_snapshot)
+                    {
+                        const auto & columns_description = storage_snapshot->metadata->getColumns();
+                        if (auto column_default = columns_description.getDefault(col_node->getColumnName()))
+                        {
+                            if (column_default->kind == ColumnDefaultKind::Proxy && column_default->proxy_element_expression)
+                            {
+                                auto element_lambda = buildQueryTree(column_default->proxy_element_expression, scope.context);
+                                if (element_lambda->as<LambdaNode>())
+                                {
+                                    QueryTreeNodePtr expanded = QueryAnalyzer::expandProxyElement(
+                                        std::static_pointer_cast<LambdaNode>(element_lambda),
+                                        args[1]);
+                                    node = expanded;
+                                    auto projection_names = resolveExpressionNode(node, scope, true /*allow_lambda_expression*/, false /*allow_table_expression*/);
+                                    if (simplifyProxyElementExpression(node))
+                                        return resolveExpressionNode(node, scope, true /*allow_lambda_expression*/, false /*allow_table_expression*/);
+                                    return projection_names;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     /// Replace right IN function argument if it is table or table function with subquery that read ordinary columns
     if (is_special_function_in)

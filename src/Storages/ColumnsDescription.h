@@ -48,10 +48,11 @@ struct GetColumnsOptions
         Materialized = 2,
         Aliases = 4,
         Ephemeral = 8,
+        Proxy = 16,
         OrdinaryAndAliases = Ordinary | Aliases,
         AllPhysical = Ordinary | Materialized,
         AllPhysicalAndAliases = AllPhysical | Aliases,
-        All = AllPhysical | Aliases | Ephemeral,
+        All = AllPhysical | Aliases | Ephemeral | Proxy,
     };
 
     GetColumnsOptions(Kind kind_) : kind(kind_) {} /// NOLINT(google-explicit-constructor)
@@ -154,8 +155,9 @@ public:
     NamesAndTypesList getInsertable() const; /// ordinary + ephemeral
     NamesAndTypesList getAliases() const;
     NamesAndTypesList getEphemeral() const;
+    NamesAndTypesList getProxy() const;
     NamesAndTypesList getAllPhysical() const; /// ordinary + materialized.
-    NamesAndTypesList getAll() const; /// ordinary + materialized + aliases + ephemeral
+    NamesAndTypesList getAll() const; /// ordinary + materialized + aliases + ephemeral + proxy
     /// Returns .size0/.null/...
     NamesAndTypesList getSubcolumns(const String & name_in_storage) const;
     /// Returns column_name.*
@@ -200,6 +202,7 @@ public:
     bool hasPhysical(const String & column_name) const;
     bool hasNotAlias(const String & column_name) const;
     bool hasAlias(const String & column_name) const;
+    bool hasProxy(const String & column_name) const;
     bool hasColumnOrSubcolumn(GetColumnsOptions::Kind kind, const String & column_name) const;
     bool hasColumnOrNested(GetColumnsOptions::Kind kind, const String & column_name) const;
 
@@ -287,7 +290,8 @@ void getDefaultExpressionInfoInto(const ASTColumnDeclaration & col_decl, const D
 /// default expression result can be cast to column_type. Also checks, that we
 /// don't have strange constructions in default expression like SELECT query or
 /// arrayJoin function.
-void validateColumnsDefaults(ASTPtr default_expr_list, const NamesAndTypesList & all_columns, ContextPtr context);
-Block validateColumnsDefaultsAndGetSampleBlock(ASTPtr default_expr_list, const NamesAndTypesList & all_columns, ContextPtr context);
+/// PROXY columns are excluded from cycle detection (their body is a macro, not evaluated at insert).
+void validateColumnsDefaults(ASTPtr default_expr_list, const NamesAndTypesList & all_columns, ContextPtr context, const NameSet & proxy_column_names = {});
+Block validateColumnsDefaultsAndGetSampleBlock(ASTPtr default_expr_list, const NamesAndTypesList & all_columns, ContextPtr context, const NameSet & proxy_column_names = {});
 
 }
