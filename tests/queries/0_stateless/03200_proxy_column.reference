@@ -1,0 +1,47 @@
+{'alpha':'a','beta':'b','zeta':'z','omega':'o'}
+a	z
+1	{'alpha':'a','beta':'b'}	{'zeta':'z','omega':'o'}	{'alpha':'a','beta':'b','zeta':'z','omega':'o'}
+CREATE TABLE default.test_proxy
+(
+    `id` UInt64,
+    `attrs` Map(String, String) PROXY mapConcat(attrs_lo, attrs_hi) ELEMENT (k -> if(k < 'm', attrs_lo[k], attrs_hi[k])),
+    `attrs_lo` Map(String, String),
+    `attrs_hi` Map(String, String)
+)
+ENGINE = MergeTree
+ORDER BY id
+SETTINGS index_granularity = 8192
+1	2
+FOO	BAR	BAZ	QUX
+{'baz':'BAZ','foo':'FOO','qux':'QUX','bar':'BAR'}
+A
+Expression ((Project names + Projection))
+  Expression ((WHERE + Change column names to column identifiers))
+    ReadFromMergeTree (default.test_proxy_indexes)
+    Indexes:
+      PrimaryKey
+        Condition: true
+        Parts: 1/1
+        Granules: 1/1
+      Skip
+        Name: idx_lo_alpha
+        Description: set GRANULARITY 1
+        Condition: (arrayElement(attrs_lo, \'alpha\') in [\'match\', \'match\'])
+        Parts: 1/1
+        Granules: 1/1
+      Ranges: 1
+Expression ((Project names + Projection))
+  Expression ((WHERE + Change column names to column identifiers))
+    ReadFromMergeTree (default.test_proxy_sharded_indexes)
+    Indexes:
+      PrimaryKey
+        Condition: true
+        Parts: 1/1
+        Granules: 1/1
+      Skip
+        Name: idx_s1_foo
+        Description: set GRANULARITY 1
+        Condition: (arrayElement(s1, \'foo\') in [\'FOO\', \'FOO\'])
+        Parts: 1/1
+        Granules: 1/1
+      Ranges: 1
