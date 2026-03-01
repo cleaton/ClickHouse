@@ -20,6 +20,23 @@ SELECT attrs FROM test_proxy;
 -- C4: Element access with constant key
 SELECT attrs['alpha'], attrs['zeta'] FROM test_proxy;
 
+-- C4.1: ELEMENT lambda may call SQL UDF, keeping proxy logic function-based
+DROP FUNCTION IF EXISTS proxy_pick_m_03200;
+CREATE FUNCTION proxy_pick_m_03200 AS (k, lo, hi) -> if(k < 'm', lo[k], hi[k]);
+
+DROP TABLE IF EXISTS test_proxy_udf_element;
+CREATE TABLE test_proxy_udf_element (
+    id UInt64,
+    attrs Map(String, String) PROXY
+        mapConcat(attrs_lo, attrs_hi)
+        ELEMENT (k) -> proxy_pick_m_03200(k, attrs_lo, attrs_hi),
+    attrs_lo Map(String, String),
+    attrs_hi Map(String, String)
+) ENGINE = MergeTree() ORDER BY id;
+
+INSERT INTO test_proxy_udf_element (id, attrs_lo, attrs_hi) VALUES (1, {'alpha':'a', 'beta':'b'}, {'zeta':'z', 'omega':'o'});
+SELECT attrs['alpha'], attrs['zeta'] FROM test_proxy_udf_element;
+
 -- C5: SELECT * includes proxy column
 SELECT * FROM test_proxy;
 
@@ -128,3 +145,5 @@ DROP TABLE test_sharded_map;
 DROP TABLE test_proxy_nested_lambda;
 DROP TABLE test_proxy_indexes;
 DROP TABLE test_proxy_sharded_indexes;
+DROP TABLE test_proxy_udf_element;
+DROP FUNCTION IF EXISTS proxy_pick_m_03200;

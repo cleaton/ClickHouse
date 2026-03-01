@@ -179,6 +179,54 @@ bool simplifyProxyElementExpression(QueryTreeNodePtr & node)
 
     return changed;
 }
+
+LambdaNodePtr tryGetProxyElementLambda(
+    const QueryTreeNodePtr & possible_proxy_column,
+    const ContextPtr & context)
+{
+    const auto * col_node = possible_proxy_column->as<ColumnNode>();
+    if (!col_node)
+        return {};
+
+    auto col_source = col_node->getColumnSourceOrNull();
+    if (!col_source)
+        return {};
+
+    const auto * table_node = col_source->as<TableNode>();
+    if (!table_node)
+        return {};
+
+    auto storage_snapshot = table_node->getStorageSnapshot();
+    if (!storage_snapshot)
+        return {};
+
+    const auto & columns_description = storage_snapshot->metadata->getColumns();
+    auto column_default = columns_description.getDefault(col_node->getColumnName());
+    if (!column_default || column_default->kind != ColumnDefaultKind::Proxy || !column_default->proxy_element_expression)
+        return {};
+
+    auto element_lambda = buildQueryTree(column_default->proxy_element_expression, context);
+    const auto * lambda_node = element_lambda->as<LambdaNode>();
+    if (!lambda_node)
+    {
+        throw Exception(
+            ErrorCodes::BAD_ARGUMENTS,
+            "PROXY ELEMENT expression for column {} must be a lambda expression",
+            backQuote(col_node->getColumnName()));
+    }
+
+    const auto & lambda_arguments = lambda_node->getArguments().getNodes();
+    if (lambda_arguments.size() != 1)
+    {
+        throw Exception(
+            ErrorCodes::BAD_ARGUMENTS,
+            "PROXY ELEMENT expression for column {} must have exactly one lambda argument, got {}",
+            backQuote(col_node->getColumnName()),
+            lambda_arguments.size());
+    }
+
+    return std::static_pointer_cast<LambdaNode>(element_lambda);
+}
 }
 
 /// Checks if node is a NULL constant
@@ -855,40 +903,13 @@ ProjectionNames QueryAnalyzer::resolveFunction(QueryTreeNodePtr & node, Identifi
         const auto & args = function_node.getArguments().getNodes();
         if (args.size() == 2)
         {
-            const auto * col_node = args[0]->as<ColumnNode>();
-            if (col_node)
+            if (LambdaNodePtr element_lambda = tryGetProxyElementLambda(args[0], scope.context))
             {
-                auto col_source = col_node->getColumnSourceOrNull();
-                if (col_source)
-                {
-                    StorageSnapshotPtr storage_snapshot;
-                    if (auto * table_node = col_source->as<TableNode>())
-                        storage_snapshot = table_node->getStorageSnapshot();
-                    /// For non-table sources keep regular arrayElement semantics.
-
-                    if (storage_snapshot)
-                    {
-                        const auto & columns_description = storage_snapshot->metadata->getColumns();
-                        if (auto column_default = columns_description.getDefault(col_node->getColumnName()))
-                        {
-                            if (column_default->kind == ColumnDefaultKind::Proxy && column_default->proxy_element_expression)
-                            {
-                                auto element_lambda = buildQueryTree(column_default->proxy_element_expression, scope.context);
-                                if (element_lambda->as<LambdaNode>())
-                                {
-                                    QueryTreeNodePtr expanded = QueryAnalyzer::expandProxyElement(
-                                        std::static_pointer_cast<LambdaNode>(element_lambda),
-                                        args[1]);
-                                    node = expanded;
-                                    auto projection_names = resolveExpressionNode(node, scope, true /*allow_lambda_expression*/, false /*allow_table_expression*/);
-                                    if (simplifyProxyElementExpression(node))
-                                        return resolveExpressionNode(node, scope, true /*allow_lambda_expression*/, false /*allow_table_expression*/);
-                                    return projection_names;
-                                }
-                            }
-                        }
-                    }
-                }
+                node = QueryAnalyzer::expandProxyElement(element_lambda, args[1]);
+                auto projection_names = resolveExpressionNode(node, scope, true /*allow_lambda_expression*/, false /*allow_table_expression*/);
+                if (simplifyProxyElementExpression(node))
+                    return resolveExpressionNode(node, scope, true /*allow_lambda_expression*/, false /*allow_table_expression*/);
+                return projection_names;
             }
         }
     }

@@ -1,5 +1,6 @@
 {'alpha':'a','beta':'b','zeta':'z','omega':'o'}
 a	z
+a	z
 1	{'alpha':'a','beta':'b'}	{'zeta':'z','omega':'o'}	{'alpha':'a','beta':'b','zeta':'z','omega':'o'}
 CREATE TABLE default.test_proxy
 (

@@ -581,9 +581,17 @@ NamesAndTypesList ColumnsDescription::get(const GetColumnsOptions & options) con
 {
     NamesAndTypesList res;
 
-    if (options.kind == GetColumnsOptions::All)
+    if (options.kind == GetColumnsOptions::AllWithProxy)
     {
         res = getAll();
+    }
+    else if (options.kind == GetColumnsOptions::All)
+    {
+        res = getAllPhysical();
+        auto aliases = getAliases();
+        auto ephemerals = getEphemeral();
+        res.insert(res.end(), aliases.begin(), aliases.end());
+        res.insert(res.end(), ephemerals.begin(), ephemerals.end());
     }
     else if (options.kind == GetColumnsOptions::AllPhysical || options.kind == GetColumnsOptions::AllPhysicalAndAliases)
     {

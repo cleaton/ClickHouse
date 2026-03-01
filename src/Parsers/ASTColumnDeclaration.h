@@ -66,35 +66,16 @@ private:
         return idx == kNotSet ? nullptr : children[idx];
     }
 
-    void setChild(IndexSlot slot, ASTPtr node)
+    void setChild(IndexSlot slot, ASTPtr && node)
     {
         if (!node)
-        {
-            UInt8 idx = getIndex(slot);
-            if (idx != kNotSet)
-            {
-                children.erase(children.begin() + idx);
-                setIndex(slot, kNotSet);
-                // After erase, we must update all other indices that were pointing beyond this one
-                for (UInt8 s : {TYPE, DEFAULT_EXPR, COMMENT, CODEC, STATS, TTL, COLLATION, SETTINGS, PROXY_ELEMENT})
-                {
-                    UInt8 other_idx = getIndex(static_cast<IndexSlot>(s));
-                    if (other_idx != kNotSet && other_idx > idx)
-                        setIndex(static_cast<IndexSlot>(s), other_idx - 1);
-                }
-            }
             return;
-        }
 
         UInt8 idx = getIndex(slot);
         if (idx != kNotSet)
             children[idx] = std::move(node);
         else
         {
-            /// Ensure we don't exceed 4 bits for index
-            if (children.size() >= kNotSet)
-                throw Exception(ErrorCodes::LOGICAL_ERROR, "Too many children in ASTColumnDeclaration");
-
             setIndex(slot, static_cast<UInt8>(children.size()));
             children.push_back(std::move(node));
         }
@@ -112,15 +93,15 @@ public:
     ASTPtr getSettings() const { return getChildOrNull(SETTINGS); }
     ASTPtr getProxyElementExpression() const { return getChildOrNull(PROXY_ELEMENT); }
 
-    void setType(ASTPtr node) { setChild(TYPE, std::move(node)); }
-    void setDefaultExpression(ASTPtr node) { setChild(DEFAULT_EXPR, std::move(node)); }
-    void setComment(ASTPtr node) { setChild(COMMENT, std::move(node)); }
-    void setCodec(ASTPtr node) { setChild(CODEC, std::move(node)); }
-    void setStatisticsDesc(ASTPtr node) { setChild(STATS, std::move(node)); }
-    void setTTL(ASTPtr node) { setChild(TTL, std::move(node)); }
-    void setCollation(ASTPtr node) { setChild(COLLATION, std::move(node)); }
-    void setSettings(ASTPtr node) { setChild(SETTINGS, std::move(node)); }
-    void setProxyElementExpression(ASTPtr node) { setChild(PROXY_ELEMENT, std::move(node)); }
+    void setType(ASTPtr && node) { setChild(TYPE, std::move(node)); }
+    void setDefaultExpression(ASTPtr && node) { setChild(DEFAULT_EXPR, std::move(node)); }
+    void setComment(ASTPtr && node) { setChild(COMMENT, std::move(node)); }
+    void setCodec(ASTPtr && node) { setChild(CODEC, std::move(node)); }
+    void setStatisticsDesc(ASTPtr && node) { setChild(STATS, std::move(node)); }
+    void setTTL(ASTPtr && node) { setChild(TTL, std::move(node)); }
+    void setCollation(ASTPtr && node) { setChild(COLLATION, std::move(node)); }
+    void setSettings(ASTPtr && node) { setChild(SETTINGS, std::move(node)); }
+    void setProxyElementExpression(ASTPtr && node) { setChild(PROXY_ELEMENT, std::move(node)); }
 
     String getID(char delim) const override { return "ColumnDeclaration" + (delim + name); }
 

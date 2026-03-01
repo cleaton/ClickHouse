@@ -52,7 +52,8 @@ struct GetColumnsOptions
         OrdinaryAndAliases = Ordinary | Aliases,
         AllPhysical = Ordinary | Materialized,
         AllPhysicalAndAliases = AllPhysical | Aliases,
-        All = AllPhysical | Aliases | Ephemeral | Proxy,
+        All = AllPhysical | Aliases | Ephemeral,
+        AllWithProxy = All | Proxy,
     };
 
     GetColumnsOptions(Kind kind_) : kind(kind_) {} /// NOLINT(google-explicit-constructor)
