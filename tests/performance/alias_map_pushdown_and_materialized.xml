@@ -2,7 +2,7 @@
 
     <settings>
         <optimize_map_alias_pushdown>1</optimize_map_alias_pushdown>
-        <optimize_use_materialized_columns>1</optimize_use_materialized_columns>
+        <optimize_map_materialized_columns>1</optimize_map_materialized_columns>
     </settings>
 
     <create_query>

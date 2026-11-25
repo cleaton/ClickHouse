@@ -71,7 +71,8 @@ public:
             if (select_added_columns)
             {
                 auto & index_hint_table_expression_data = planner_context->getOrCreateTableExpressionData(column_node->getColumnSource());
-                index_hint_table_expression_data.markColumnForAccessCheck(column_node->getColumnName());
+                index_hint_table_expression_data.markColumnForAccessCheck(
+                    column_node->getAccessCheckColumnName().value_or(column_node->getColumnName()));
             }
             return;
         }
@@ -111,22 +112,26 @@ public:
                 /// See also comment for `select_added_columns`
                 visitor_for_alias_column.select_added_columns = false;
                 visitor_for_alias_column.keep_alias_columns = keep_alias_columns;
-                visitor_for_alias_column.visit(column_node->getExpression());
 
                 if (!keep_alias_columns)
                 {
                     if (access_check_col && select_added_columns)
                         table_expression_data.markColumnForAccessCheck(*access_check_col);
 
-                    /// For PREWHERE we can just replace ALIAS column with it's expression,
-                    /// because ActionsDAG for PREWHERE applied right on top of table expression
+                    /// For PREWHERE we can just replace ALIAS column with its expression,
+                    /// because ActionsDAG for PREWHERE is applied right on top of table expression
                     /// and cannot affect subqueries or other table expressions.
-                    node = column_node->getExpression();
+                    /// Clone before visiting so `keep_alias_columns = false` does not mutate shared ALIAS expressions.
+                    QueryTreeNodePtr inlined_expression = column_node->getExpression()->clone();
+                    visitor_for_alias_column.visit(inlined_expression);
+                    node = std::move(inlined_expression);
                     /// The visitor above has registered the expression's source columns as read but not selected, and the
                     /// children walk that follows must not select them either: a grant on the ALIAS name is sufficient.
                     inlined_alias_expressions.insert(node.get());
                     return;
                 }
+
+                visitor_for_alias_column.visit(column_node->getExpression());
 
                 auto column_identifier = planner_context->getGlobalPlannerContext()->createColumnIdentifier(node);
 
@@ -178,7 +183,12 @@ public:
                         else
                             table_expression_data.markSelectedColumn(column_node->getColumn().name);
                     }
-                    node = column_node->getExpression();
+                    CollectSourceColumnsVisitor visitor_for_alias_column(planner_context);
+                    visitor_for_alias_column.select_added_columns = false;
+                    visitor_for_alias_column.keep_alias_columns = false;
+                    QueryTreeNodePtr inlined_expression = column_node->getExpression()->clone();
+                    visitor_for_alias_column.visit(inlined_expression);
+                    node = std::move(inlined_expression);
                     inlined_alias_expressions.insert(node.get());
                     return;
                 }
@@ -395,12 +405,13 @@ public:
         }
 
         /// The contract lists top-level names; a subcolumn is admitted through its origin column.
+        const auto & prewhere_column_name = column_node->getAccessCheckColumnName().value_or(column_node->getColumnName());
         if (table_supported_prewhere_columns
             && !prewhereSupportedColumnsContain(
                 *table_supported_prewhere_columns,
                 table_supported_prewhere_columns_include_subcolumns,
                 table_storage_snapshot->metadata->getColumns(),
-                column_node->getColumnName()))
+                prewhere_column_name))
             throw Exception(ErrorCodes::ILLEGAL_PREWHERE,
                 "Table expression {} does not support column {} in PREWHERE. In query {}",
                 table_expression->formatASTForErrorMessage(),

@@ -54,9 +54,9 @@ auth	1
 checkout	2
 search	1
 1	right_svc	
-2	\N	
-3	\N	
-4	\N	
+2		
+3		
+4		
 1	checkout
 2	
 1	checkout
@@ -73,3 +73,38 @@ search	1
 3	search	
 4	checkout	
 1	checkout
+=== Hardening: GROUP BY whole map, ROLLUP group_by_use_nulls, PREWHERE nested alias, EXPLAIN SYNTAX ===
+\N	4
+auth	1
+checkout	2
+search	1
+auth	1
+checkout	1
+checkout	1
+search	1
+auth	1
+checkout	1
+checkout	1
+search	1
+1
+1	checkout
+2	auth
+3	search
+4	checkout
+1	ok		
+=== Hardening: SummingMergeTree & FINAL must NOT substitute MATERIALIZED columns ===
+1	live_sum
+1
+1
+=== Hardening: Map(Int64, String) key normalization & PK candidate preference ===
+1	found_42	found_42
+1
+=== Hardening: empty map, Nullable key/pred, dead-branch if, non-boolean and, FixedString, transform_null_in, rand() ===
+	0	0
+abc	x	ok		0
+ok		0
+ok	1	ok	1
+v1	
+\N	ok
+ok	1
+1

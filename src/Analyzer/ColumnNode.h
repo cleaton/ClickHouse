@@ -146,6 +146,16 @@ public:
         access_check_column_name = std::move(name);
     }
 
+    [[nodiscard]] const ASTPtr & getDisplayAST() const
+    {
+        return display_ast;
+    }
+
+    void setDisplayAST(ASTPtr display_ast_)
+    {
+        display_ast = std::move(display_ast_);
+    }
+
     [[nodiscard]] QueryTreeNodeType getNodeType() const override
     {
         return QueryTreeNodeType::COLUMN;
@@ -177,6 +187,7 @@ private:
     NameAndTypePair column;
     TableExpressionNodeWeakPtr source;
     std::optional<String> access_check_column_name;
+    ASTPtr display_ast;
 
     static constexpr size_t expression_child_index = 0;
     static constexpr size_t children_size = expression_child_index + 1;

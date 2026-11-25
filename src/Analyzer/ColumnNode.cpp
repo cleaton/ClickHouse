@@ -106,13 +106,15 @@ QueryTreeNodePtr ColumnNode::cloneImpl() const
     auto cloned = std::make_shared<ColumnNode>(column, source);
     if (access_check_column_name)
         cloned->setAccessCheckColumnName(*access_check_column_name);
+    if (display_ast)
+        cloned->setDisplayAST(display_ast->clone());
     return cloned;
 }
 
 ASTPtr ColumnNode::toASTImpl(const ConvertToASTOptions & options) const
 {
-    if (access_check_column_name.has_value() && hasExpression())
-        return getExpression()->toAST(options);
+    if (display_ast)
+        return display_ast->clone();
     std::vector<std::string> column_identifier_parts;
 
     auto column_source = getColumnSourceOrNull();

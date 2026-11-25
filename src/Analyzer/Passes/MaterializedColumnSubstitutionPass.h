@@ -8,7 +8,7 @@ namespace DB
 /** Rewrites constant-key `Map` element lookups (`arrayElement(col, 'k')`) on MergeTree
   * tables to matching `MATERIALIZED` columns defined as `col['k']` of the same type.
   *
-  * Enabled with setting `optimize_use_materialized_columns`.
+  * Enabled with setting `optimize_map_materialized_columns`.
   */
 class MaterializedColumnSubstitutionPass final : public IQueryTreePass
 {

@@ -6381,9 +6381,23 @@ Possible values:
 )", 0)                                                                                                                                         \
     DECLARE(Bool, optimize_map_alias_pushdown, false, R"(
 Enable pushing `Map` lookups (`arrayElement`, `has`, `mapContainsKey`) into `ALIAS` column expressions before subcolumn and materialized-column optimizations, while keeping column-level access checks on the `ALIAS` column.
+
+The default is `false`.
+
+Possible values:
+
+- true, false
 )", 0)                                                                                                                                         \
-    DECLARE(Bool, optimize_use_materialized_columns, false, R"(
-Enable substituting `Map` element lookups (`col['const_key']`) on `MergeTree` tables with matching `MATERIALIZED` columns defined as `col['const_key']` of the same type.
+    DECLARE(Bool, optimize_map_materialized_columns, false, R"(
+Enable substituting `Map` element lookups (`col['const_key']`) on `Ordinary` `MergeTree` tables (without `FINAL`) with matching `MATERIALIZED` columns defined as `col['const_key']` of the same type.
+
+Assumes matching `MATERIALIZED` columns are kept in sync with the underlying `Map` column (for example, via `MATERIALIZE COLUMN` after adding a column) and are not altered independently.
+
+The default is `false`.
+
+Possible values:
+
+- true, false
 )", 0)                                                                                                                                         \
     DECLARE(Bool, optimize_append_index, false, R"(
 Use [constraints](/reference/statements/create/table#constraints) in order to append index condition. The default is `false`.

@@ -26,3 +26,21 @@ QUERY_CACHE_USED_WITH_NONDETERMINISTIC_FUNCTIONS
 2	222-22
 1	***
 2	***
+=== 8. Hardening RBAC & QueryResultCache: secret key col, subcolumns, EXPLAIN SYNTAX, indexHint, subquery & DEFINER view cache ===
+ACCESS_DENIED
+ACCESS_DENIED
+1	checkout
+2	***@acme.com
+1	8
+2	4
+1	internal_token	0
+1	service	1
+2	internal_token	0
+2	service	1
+2
+0
+1	111-11
+2	222-22
+1	***
+2	***
+QUERY_CACHE_USED_WITH_NONDETERMINISTIC_FUNCTIONS

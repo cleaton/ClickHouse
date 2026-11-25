@@ -11,6 +11,7 @@ DICT_NAME="${CLICKHOUSE_DATABASE}.mask_rules_dict"
 
 cleanup()
 {
+    ${CLICKHOUSE_CLIENT} -q "DROP VIEW IF EXISTS ${CLICKHOUSE_DATABASE}.v_sec_def_alias;" >/dev/null 2>&1 || true
     ${CLICKHOUSE_CLIENT} -q "DROP DICTIONARY IF EXISTS ${DICT_NAME};" >/dev/null 2>&1 || true
     ${CLICKHOUSE_CLIENT} -q "DROP TABLE IF EXISTS ${DICT_TBL}, ${CLICKHOUSE_DATABASE}.logs_masking;" >/dev/null 2>&1 || true
     ${CLICKHOUSE_CLIENT} -q "DROP USER IF EXISTS ${U_ADMIN}, ${U_ANALYST};" >/dev/null 2>&1 || true
@@ -52,8 +53,11 @@ LIFETIME(MIN 0 MAX 0);
 CREATE TABLE ${CLICKHOUSE_DATABASE}.logs_masking
 (
     ts UInt32,
+    secret_key_col String,
+    public_key_col String,
     raw_attrs Map(String, String),
     __mat_service String MATERIALIZED raw_attrs['service'],
+    attrs_empty Map(String, String) ALIAS CAST(map(), 'Map(String, String)'),
     attrs_static Map(String, String) ALIAS mapApply(
         (k, v) -> (k, multiIf(
             currentUser() = '${U_ADMIN}', v,
@@ -75,13 +79,18 @@ ENGINE = MergeTree
 ORDER BY (ts, __mat_service);
 
 INSERT INTO ${CLICKHOUSE_DATABASE}.logs_masking VALUES
-    (1, {'service': 'checkout', 'ssn': '111-11', 'email': 'alice@acme.com', 'internal_token': 'tok1', 'msg': 'secret:payload', 'secret_tag': 't1'}),
-    (2, {'service': 'auth',     'ssn': '222-22', 'email': 'bob@acme.com',   'internal_token': 'tok2', 'msg': 'ok_msg',         'secret_tag': 't2'});
+    (1, 'service', 'service', {'service': 'checkout', 'ssn': '111-11', 'email': 'alice@acme.com', 'internal_token': 'tok1', 'msg': 'secret:payload', 'secret_tag': 't1'}),
+    (2, 'ssn',     'email',   {'service': 'auth',     'ssn': '222-22', 'email': 'bob@acme.com',   'internal_token': 'tok2', 'msg': 'ok_msg',         'secret_tag': 't2'});
 
-GRANT SELECT(ts, attrs_static, attrs_dict) ON ${CLICKHOUSE_DATABASE}.logs_masking TO ${U_ADMIN};
-GRANT SELECT(ts, attrs_static, attrs_dict) ON ${CLICKHOUSE_DATABASE}.logs_masking TO ${U_ANALYST};
+GRANT SELECT(ts, public_key_col, attrs_empty, attrs_static, attrs_dict) ON ${CLICKHOUSE_DATABASE}.logs_masking TO ${U_ADMIN};
+GRANT SELECT(ts, public_key_col, attrs_empty, attrs_static, attrs_dict) ON ${CLICKHOUSE_DATABASE}.logs_masking TO ${U_ANALYST};
 GRANT dictGet ON ${DICT_NAME} TO ${U_ADMIN};
 GRANT dictGet ON ${DICT_NAME} TO ${U_ANALYST};
+
+CREATE VIEW ${CLICKHOUSE_DATABASE}.v_sec_def_alias DEFINER = ${U_ADMIN} SQL SECURITY DEFINER AS
+SELECT ts, attrs_static['ssn'] AS ssn_val FROM ${CLICKHOUSE_DATABASE}.logs_masking;
+GRANT SELECT ON ${CLICKHOUSE_DATABASE}.v_sec_def_alias TO ${U_ADMIN};
+GRANT SELECT ON ${CLICKHOUSE_DATABASE}.v_sec_def_alias TO ${U_ANALYST};
 "
 
 echo "=== 1. RBAC blocks direct access to raw_attrs and __mat_service ==="
@@ -89,7 +98,7 @@ ${CLICKHOUSE_CLIENT} --user "${U_ANALYST}" -q "SELECT raw_attrs FROM ${CLICKHOUS
 ${CLICKHOUSE_CLIENT} --user "${U_ANALYST}" -q "SELECT __mat_service FROM ${CLICKHOUSE_DATABASE}.logs_masking" 2>&1 | grep -m1 -o "ACCESS_DENIED"
 
 echo "=== 2. Static & value-based masking via pushdown + MATERIALIZED under RBAC ==="
-${CLICKHOUSE_CLIENT} --user "${U_ANALYST}" --optimize_map_alias_pushdown=1 --optimize_use_materialized_columns=1 -n -q "
+${CLICKHOUSE_CLIENT} --user "${U_ANALYST}" --optimize_map_alias_pushdown=1 --optimize_map_materialized_columns=1 -n -q "
 SELECT ts, attrs_static['service'], attrs_static['ssn'], attrs_static['email'], attrs_static['missing'], attrs_static['internal_token'], attrs_static['msg']
 FROM ${CLICKHOUSE_DATABASE}.logs_masking
 WHERE attrs_static['service'] IN ('checkout', 'auth')
@@ -103,30 +112,30 @@ SELECT ts, mapSort(attrs_static) FROM ${CLICKHOUSE_DATABASE}.logs_masking ORDER 
 "
 
 echo "=== 4. Admin sees unmasked values ==="
-${CLICKHOUSE_CLIENT} --user "${U_ADMIN}" --optimize_map_alias_pushdown=1 --optimize_use_materialized_columns=1 -q "
+${CLICKHOUSE_CLIENT} --user "${U_ADMIN}" --optimize_map_alias_pushdown=1 --optimize_map_materialized_columns=1 -q "
 SELECT ts, attrs_static['service'], attrs_static['ssn'], attrs_static['email'], attrs_static['internal_token'], attrs_static['msg']
 FROM ${CLICKHOUSE_DATABASE}.logs_masking ORDER BY ts;
 "
 
 echo "=== 5. Dictionary-driven masking + EXPLAIN shows __mat_service used ==="
-${CLICKHOUSE_CLIENT} --user "${U_ANALYST}" --optimize_map_alias_pushdown=1 --optimize_use_materialized_columns=1 -n -q "
+${CLICKHOUSE_CLIENT} --user "${U_ANALYST}" --optimize_map_alias_pushdown=1 --optimize_map_materialized_columns=1 -n -q "
 SELECT ts, attrs_dict['service'], attrs_dict['ssn'], attrs_dict['secret_tag'] FROM ${CLICKHOUSE_DATABASE}.logs_masking ORDER BY ts;
 "
-${CLICKHOUSE_CLIENT} --user "${U_ANALYST}" --optimize_map_alias_pushdown=1 --optimize_use_materialized_columns=1 -q "EXPLAIN actions = 1 SELECT attrs_dict['service'] FROM ${CLICKHOUSE_DATABASE}.logs_masking" | grep -q "__mat_service" && echo 1 || echo 0
-${CLICKHOUSE_CLIENT} --user "${U_ANALYST}" --optimize_map_alias_pushdown=1 --optimize_use_materialized_columns=1 -q "EXPLAIN actions = 1 SELECT attrs_dict['service'] FROM ${CLICKHOUSE_DATABASE}.logs_masking" | grep -q "raw_attrs" && echo 1 || echo 0
+${CLICKHOUSE_CLIENT} --user "${U_ANALYST}" --optimize_map_alias_pushdown=1 --optimize_map_materialized_columns=1 -q "EXPLAIN actions = 1 SELECT attrs_dict['service'] FROM ${CLICKHOUSE_DATABASE}.logs_masking" | grep -q "__mat_service" && echo 1 || echo 0
+${CLICKHOUSE_CLIENT} --user "${U_ANALYST}" --optimize_map_alias_pushdown=1 --optimize_map_materialized_columns=1 -q "EXPLAIN actions = 1 SELECT attrs_dict['service'] FROM ${CLICKHOUSE_DATABASE}.logs_masking" | grep -q "raw_attrs" && echo 1 || echo 0
 
 echo "=== 6. Live dictionary reload updates masking with zero table DDL ==="
 ${CLICKHOUSE_CLIENT} -q "INSERT INTO ${DICT_TBL} VALUES ('${U_ANALYST}', 'service', 1);"
 ${CLICKHOUSE_CLIENT} -q "SYSTEM RELOAD DICTIONARY ${DICT_NAME};"
-${CLICKHOUSE_CLIENT} --user "${U_ANALYST}" --optimize_map_alias_pushdown=1 --optimize_use_materialized_columns=1 -q "
+${CLICKHOUSE_CLIENT} --user "${U_ANALYST}" --optimize_map_alias_pushdown=1 --optimize_map_materialized_columns=1 -q "
 SELECT ts, attrs_dict['service'], attrs_dict['ssn'] FROM ${CLICKHOUSE_DATABASE}.logs_masking ORDER BY ts;
 "
 
 echo "=== 7. QueryResultCache: unrelated queries cache cleanly, non-deterministic ALIAS does not leak across users ==="
-${CLICKHOUSE_CLIENT} --user "${U_ANALYST}" --optimize_map_alias_pushdown=1 --optimize_use_materialized_columns=1 --use_query_cache=1 -q "
+${CLICKHOUSE_CLIENT} --user "${U_ANALYST}" --optimize_map_alias_pushdown=1 --optimize_map_materialized_columns=1 --use_query_cache=1 -q "
 SELECT count() FROM ${CLICKHOUSE_DATABASE}.logs_masking;
 "
-${CLICKHOUSE_CLIENT} --user "${U_ANALYST}" --optimize_map_alias_pushdown=1 --optimize_use_materialized_columns=1 --use_query_cache=1 -q "
+${CLICKHOUSE_CLIENT} --user "${U_ANALYST}" --optimize_map_alias_pushdown=1 --optimize_map_materialized_columns=1 --use_query_cache=1 -q "
 SELECT attrs_static['ssn'] FROM ${CLICKHOUSE_DATABASE}.logs_masking ORDER BY ts;
 " 2>&1 | grep -m1 -o "QUERY_CACHE_USED_WITH_NONDETERMINISTIC_FUNCTIONS"
 
@@ -136,3 +145,28 @@ SELECT ts, attrs_static['ssn'] FROM ${CLICKHOUSE_DATABASE}.logs_masking ORDER BY
 ${CLICKHOUSE_CLIENT} --user "${U_ANALYST}" --optimize_map_alias_pushdown=1 --use_query_cache=1 --query_cache_nondeterministic_function_handling=save --query_cache_share_between_users=1 -q "
 SELECT ts, attrs_static['ssn'] FROM ${CLICKHOUSE_DATABASE}.logs_masking ORDER BY ts;
 "
+
+echo "=== 8. Hardening RBAC & QueryResultCache: secret key col, subcolumns, EXPLAIN SYNTAX, indexHint, subquery & DEFINER view cache ==="
+${CLICKHOUSE_CLIENT} --user "${U_ANALYST}" --optimize_map_alias_pushdown=1 -q "
+SELECT attrs_static[secret_key_col] FROM ${CLICKHOUSE_DATABASE}.logs_masking
+" 2>&1 | grep -m1 -o "ACCESS_DENIED"
+${CLICKHOUSE_CLIENT} --user "${U_ANALYST}" --optimize_map_alias_pushdown=1 -q "
+SELECT attrs_empty[secret_key_col] FROM ${CLICKHOUSE_DATABASE}.logs_masking
+" 2>&1 | grep -m1 -o "ACCESS_DENIED"
+${CLICKHOUSE_CLIENT} --user "${U_ANALYST}" --optimize_map_alias_pushdown=1 --optimize_map_materialized_columns=1 -n -q "
+SELECT ts, attrs_static[public_key_col] FROM ${CLICKHOUSE_DATABASE}.logs_masking ORDER BY ts;
+SELECT ts, length(attrs_static['service']) FROM ${CLICKHOUSE_DATABASE}.logs_masking ORDER BY ts;
+SELECT ts, k, has(attrs_static, k) FROM ${CLICKHOUSE_DATABASE}.logs_masking ARRAY JOIN ['service', 'internal_token'] AS k ORDER BY ts, k;
+SELECT count() FROM ${CLICKHOUSE_DATABASE}.logs_masking WHERE indexHint(attrs_static['service'] = 'checkout');
+"
+${CLICKHOUSE_CLIENT} --user "${U_ANALYST}" --optimize_map_alias_pushdown=1 --optimize_map_materialized_columns=1 -q "EXPLAIN SYNTAX SELECT attrs_static['service'] FROM ${CLICKHOUSE_DATABASE}.logs_masking" | grep -E "raw_attrs|__mat_service" | wc -l
+
+${CLICKHOUSE_CLIENT} --user "${U_ADMIN}" --optimize_map_alias_pushdown=1 --query_cache_for_subqueries=1 --query_cache_nondeterministic_function_handling=save --query_cache_share_between_users=1 -q "
+SELECT ts, s FROM (SELECT ts, attrs_static['ssn'] AS s FROM ${CLICKHOUSE_DATABASE}.logs_masking) ORDER BY ts SETTINGS query_cache_for_subqueries = 1, use_query_cache = 1;
+"
+${CLICKHOUSE_CLIENT} --user "${U_ANALYST}" --optimize_map_alias_pushdown=1 --query_cache_for_subqueries=1 --query_cache_nondeterministic_function_handling=save --query_cache_share_between_users=1 -q "
+SELECT ts, s FROM (SELECT ts, attrs_static['ssn'] AS s FROM ${CLICKHOUSE_DATABASE}.logs_masking) ORDER BY ts SETTINGS query_cache_for_subqueries = 1, use_query_cache = 1;
+"
+${CLICKHOUSE_CLIENT} --user "${U_ADMIN}" --optimize_map_alias_pushdown=1 --use_query_cache=1 -q "
+SELECT ts, ssn_val FROM ${CLICKHOUSE_DATABASE}.v_sec_def_alias ORDER BY ts;
+" 2>&1 | grep -m1 -o "QUERY_CACHE_USED_WITH_NONDETERMINISTIC_FUNCTIONS"

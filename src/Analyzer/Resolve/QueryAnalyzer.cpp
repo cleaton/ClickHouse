@@ -5493,34 +5493,7 @@ void QueryAnalyzer::initializeTableExpressionData(const TableExpressionNodePtr &
             /// Track whether a resolved ALIAS column contains any non-deterministic function
             /// (including constant-folded calls such as `currentUser` or live `dictHas`/`dictGet`)
             /// so QueryResultCache skips caching / cross-user sharing without scanning every table's unused ALIASes.
-            auto expression_is_non_deterministic = [&](const auto & self, const QueryTreeNodePtr & node) -> bool
-            {
-                if (!node)
-                    return false;
-                if (const auto * constant_node = node->as<ConstantNode>())
-                {
-                    if (!constant_node->isDeterministic())
-                        return true;
-                    if (constant_node->hasSourceExpression() && self(self, constant_node->getSourceExpression()))
-                        return true;
-                    return false;
-                }
-                if (const auto * function_node = node->as<FunctionNode>())
-                {
-                    if (function_node->isOrdinaryCall())
-                    {
-                        if (auto func = function_node->getFunction(); func && !func->isDeterministic())
-                            return true;
-                    }
-                }
-                for (const auto & child : node->getChildren())
-                {
-                    if (child && self(self, child))
-                        return true;
-                }
-                return false;
-            };
-            if (expression_is_non_deterministic(expression_is_non_deterministic, resolved_expression))
+            if (queryTreeNodeContainsNonDeterministicFunction(resolved_expression))
             {
                 scope.context->markQueryHasNonDeterministicAlias();
                 if (scope.context->hasQueryContext())

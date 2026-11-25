@@ -6,29 +6,40 @@
 #include <Analyzer/ConstantNode.h>
 #include <Analyzer/FunctionNode.h>
 #include <Analyzer/InDepthQueryTreeVisitor.h>
+#include <Analyzer/JoinNode.h>
+#include <Analyzer/QueryNode.h>
+#include <Analyzer/TableExpressionModifiers.h>
 #include <Analyzer/TableNode.h>
+#include <Common/FieldVisitorHash.h>
 #include <Common/UnorderedMapWithMemoryTracking.h>
+#include <Common/UnorderedSetWithMemoryTracking.h>
+#include <Common/VectorWithMemoryTracking.h>
 #include <Core/Field.h>
 #include <Core/NamesAndTypes.h>
 #include <Core/Settings.h>
+#include <DataTypes/DataTypeLowCardinality.h>
 #include <DataTypes/DataTypeMap.h>
 #include <DataTypes/IDataType.h>
 #include <Interpreters/Context.h>
+#include <Interpreters/convertFieldToType.h>
 #include <Parsers/ASTFunction.h>
 #include <Parsers/ASTIdentifier.h>
 #include <Parsers/ASTLiteral.h>
 #include <Storages/ColumnsDescription.h>
 #include <Storages/IStorage.h>
+#include <Storages/MergeTree/MergeTreeData.h>
 #include <Storages/StorageSnapshot.h>
 
-#include <functional>
+#include <algorithm>
 
 namespace DB
 {
 
 namespace Setting
 {
-    extern const SettingsBool optimize_use_materialized_columns;
+    extern const SettingsBool group_by_use_nulls;
+    extern const SettingsBool join_use_nulls;
+    extern const SettingsBool optimize_map_materialized_columns;
 }
 
 namespace
@@ -49,23 +60,203 @@ struct MapKeyPairHash
         SipHash hash;
         hash.update(pair.column_name.size());
         hash.update(pair.column_name);
-        hash.update(pair.key.dump());
+        FieldVisitorHash field_hash(hash);
+        applyVisitor(field_hash, pair.key);
         return hash.get64();
     }
 };
 
-using MaterializedLookupMap = UnorderedMapWithMemoryTracking<MapKeyPair, NameAndTypePair, MapKeyPairHash>;
-
-MaterializedLookupMap buildMaterializedMapForTable(const TableNode & table_node)
+struct TableColKey
 {
-    MaterializedLookupMap result;
+    const TableNode * table = nullptr;
+    String col_name;
+
+    bool operator==(const TableColKey & other) const = default;
+};
+
+struct TableColKeyHash
+{
+    size_t operator()(const TableColKey & key) const
+    {
+        SipHash hash;
+        hash.update(key.table);
+        hash.update(key.col_name.size());
+        hash.update(key.col_name);
+        return hash.get64();
+    }
+};
+
+struct MaterializedCandidate
+{
+    NameAndTypePair col;
+    bool is_in_primary_key = false;
+};
+
+struct TableLookupInfo
+{
+    DataTypePtr key_type;
+    UnorderedMapWithMemoryTracking<MapKeyPair, VectorWithMemoryTracking<MaterializedCandidate>, MapKeyPairHash> by_key;
+};
+
+Field normalizeMapKeyField(const Field & value, const IDataType & key_type)
+{
+    auto unwrapped = removeLowCardinality(key_type.getPtr());
+    return tryConvertFieldToType(value, *unwrapped, nullptr /*from_type_hint*/, {} /*format_settings*/, true /*strict*/);
+}
+
+bool isConstArrayElementFirstArg(const IQueryTreeNode * parent, const IQueryTreeNode * child)
+{
+    const auto * fn = parent ? parent->as<FunctionNode>() : nullptr;
+    if (!fn || !fn->isResolved() || !fn->isOrdinaryCall() || fn->getFunctionName() != "arrayElement")
+        return false;
+    const auto & args = fn->getArguments().getNodes();
+    if (args.size() != 2 || args[0].get() != child)
+        return false;
+    const auto * key_const = args[1]->as<ConstantNode>();
+    return key_const && !key_const->isNull();
+}
+
+void collectColumnRefsOutsideConstArrayElement(
+    const QueryTreeNodePtr & node,
+    const IQueryTreeNode * parent,
+    UnorderedSetWithMemoryTracking<TableColKey, TableColKeyHash> & out)
+{
+    if (!node || node->getNodeType() == QueryTreeNodeType::QUERY || node->getNodeType() == QueryTreeNodeType::UNION)
+        return;
+
+    if (const auto * col_node = node->as<ColumnNode>())
+    {
+        if (!col_node->hasExpression())
+        {
+            auto src = col_node->getColumnSourceOrNull();
+            if (const auto * table_node = src ? src->as<TableNode>() : nullptr)
+            {
+                if (!isConstArrayElementFirstArg(parent, col_node))
+                    out.insert(TableColKey{table_node, col_node->getColumnName()});
+            }
+            return;
+        }
+    }
+
+    const IQueryTreeNode * next_parent = (node->getNodeType() == QueryTreeNodeType::LIST) ? parent : node.get();
+    for (const auto & child : node->getChildren())
+    {
+        if (child)
+            collectColumnRefsOutsideConstArrayElement(child, next_parent, out);
+    }
+}
+
+const IQueryTreeNode * getEnclosingNonListParent(const VectorWithMemoryTracking<const IQueryTreeNode *> & parent_stack)
+{
+    for (auto it = parent_stack.rbegin(); it != parent_stack.rend(); ++it)
+    {
+        if ((*it)->getNodeType() != QueryTreeNodeType::LIST)
+            return *it;
+    }
+    return nullptr;
+}
+
+class MaterializedPrecheckVisitor : public InDepthQueryTreeVisitorWithContext<MaterializedPrecheckVisitor>
+{
+public:
+    using Base = InDepthQueryTreeVisitorWithContext<MaterializedPrecheckVisitor>;
+    using Base::Base;
+
+    UnorderedSetWithMemoryTracking<const TableNode *> skip_tables;
+    UnorderedSetWithMemoryTracking<const QueryNode *> skip_query_nodes;
+    UnorderedSetWithMemoryTracking<TableColKey, TableColKeyHash> forbidden_cols;
+    UnorderedSetWithMemoryTracking<TableColKey, TableColKeyHash> whole_map_read_cols;
+
+    static bool needChildVisit(QueryTreeNodePtr & parent, QueryTreeNodePtr &)
+    {
+        return parent->getNodeType() != QueryTreeNodeType::TABLE_FUNCTION;
+    }
+
+    void enterImpl(QueryTreeNodePtr & node)
+    {
+        if (const auto * qn = node->as<QueryNode>())
+        {
+            join_depth_stack.push_back(0);
+            if (getSettings()[Setting::group_by_use_nulls]
+                && (qn->isGroupByWithRollup() || qn->isGroupByWithCube() || qn->isGroupByWithGroupingSets()))
+                skip_query_nodes.insert(qn);
+
+            for (const auto & gb_node : qn->getGroupBy().getNodes())
+                collectColumnRefsOutsideConstArrayElement(gb_node, nullptr, forbidden_cols);
+
+            for (const auto & corr_node : qn->getCorrelatedColumns().getNodes())
+                collectColumnRefsOutsideConstArrayElement(corr_node, nullptr, forbidden_cols);
+        }
+        else if (node->getNodeType() == QueryTreeNodeType::JOIN)
+        {
+            if (!join_depth_stack.empty())
+                ++join_depth_stack.back();
+        }
+        else if (const auto * tn = node->as<TableNode>())
+        {
+            if (getSettings()[Setting::join_use_nulls] && !join_depth_stack.empty() && join_depth_stack.back() > 0)
+                skip_tables.insert(tn);
+        }
+        else if (const auto * col_node = node->as<ColumnNode>())
+        {
+            if (!col_node->hasExpression() && isMap(col_node->getColumnType()))
+            {
+                auto src = col_node->getColumnSourceOrNull();
+                if (const auto * table_node = src ? src->as<TableNode>() : nullptr)
+                {
+                    const auto * parent = getEnclosingNonListParent(parent_stack);
+                    if (!isConstArrayElementFirstArg(parent, col_node))
+                        whole_map_read_cols.insert(TableColKey{table_node, col_node->getColumnName()});
+                }
+            }
+        }
+
+        parent_stack.push_back(node.get());
+    }
+
+    void leaveImpl(QueryTreeNodePtr & node)
+    {
+        if (!parent_stack.empty())
+            parent_stack.pop_back();
+
+        if (node->getNodeType() == QueryTreeNodeType::JOIN)
+        {
+            if (!join_depth_stack.empty() && join_depth_stack.back() > 0)
+                --join_depth_stack.back();
+        }
+        else if (node->getNodeType() == QueryTreeNodeType::QUERY)
+        {
+            if (!join_depth_stack.empty())
+                join_depth_stack.pop_back();
+        }
+    }
+
+private:
+    VectorWithMemoryTracking<size_t> join_depth_stack;
+    VectorWithMemoryTracking<const IQueryTreeNode *> parent_stack;
+};
+
+UnorderedMapWithMemoryTracking<String, TableLookupInfo> buildMaterializedMapForTable(const TableNode & table_node)
+{
+    UnorderedMapWithMemoryTracking<String, TableLookupInfo> result;
     const auto & storage = table_node.getStorage();
-    if (!storage || !storage->isMergeTree() || storage->isRemote() || storage->getName() == "Alias")
+    if (!storage || storage->isRemote() || storage->getName() == "Alias")
+        return result;
+
+    if (table_node.hasTableExpressionModifiers() && table_node.getTableExpressionModifiers()->hasFinal())
+        return result;
+
+    const auto * merge_tree = dynamic_cast<const MergeTreeData *>(storage.get());
+    if (!merge_tree || merge_tree->merging_params.mode != MergeTreeData::MergingParams::Ordinary)
         return result;
 
     const auto & metadata = table_node.getStorageSnapshot()->metadata;
     if (!metadata)
         return result;
+
+    UnorderedSetWithMemoryTracking<String> pk_columns;
+    for (const auto & pk_col : metadata->getPrimaryKey().column_names)
+        pk_columns.insert(pk_col);
 
     const auto & columns = metadata->getColumns();
     for (const auto & col : columns)
@@ -91,11 +282,35 @@ MaterializedLookupMap buildMaterializedMapForTable(const TableNode & table_node)
         if (!isMap(base_col_type))
             continue;
 
-        const auto value_type = assert_cast<const DataTypeMap &>(*base_col_type).getValueType();
+        const auto & map_type = assert_cast<const DataTypeMap &>(*base_col_type);
+        const auto & value_type = map_type.getValueType();
         if (!col.type->equals(*value_type))
             continue;
 
-        result.try_emplace(MapKeyPair{base_col_name, key_lit->value}, NameAndTypePair{col.name, col.type});
+        Field normalized_key = normalizeMapKeyField(key_lit->value, *map_type.getKeyType());
+        if (normalized_key.isNull())
+            continue;
+
+        auto & info = result[base_col_name];
+        if (!info.key_type)
+            info.key_type = map_type.getKeyType();
+
+        info.by_key[MapKeyPair{base_col_name, std::move(normalized_key)}].push_back(
+            MaterializedCandidate{NameAndTypePair{col.name, col.type}, pk_columns.contains(col.name)});
+    }
+
+    for (auto & [base_col, info] : result)
+    {
+        for (auto & [key_pair, candidates] : info.by_key)
+        {
+            std::stable_sort(
+                candidates.begin(),
+                candidates.end(),
+                [](const MaterializedCandidate & lhs, const MaterializedCandidate & rhs)
+                {
+                    return lhs.is_in_primary_key && !rhs.is_in_primary_key;
+                });
+        }
     }
 
     return result;
@@ -104,8 +319,10 @@ MaterializedLookupMap buildMaterializedMapForTable(const TableNode & table_node)
 class MaterializedColumnSubstitutionVisitor : public InDepthQueryTreeVisitorWithContext<MaterializedColumnSubstitutionVisitor>
 {
 public:
-    using Base = InDepthQueryTreeVisitorWithContext<MaterializedColumnSubstitutionVisitor>;
-    using Base::Base;
+    MaterializedColumnSubstitutionVisitor(ContextPtr context_, MaterializedPrecheckVisitor precheck_)
+        : InDepthQueryTreeVisitorWithContext(std::move(context_))
+        , precheck(std::move(precheck_))
+    {}
 
     static bool needChildVisit(QueryTreeNodePtr & parent, QueryTreeNodePtr &)
     {
@@ -114,19 +331,37 @@ public:
 
     void enterImpl(QueryTreeNodePtr & node)
     {
+        if (const auto * qn = node->as<QueryNode>())
+            query_node_stack.push_back(qn);
+
         if (const auto * col_node = node->as<ColumnNode>(); col_node && col_node->hasExpression())
-            ++alias_depth;
+        {
+            auto src = col_node->getColumnSourceOrNull();
+            if (src && src->getNodeType() == QueryTreeNodeType::TABLE)
+                ++alias_depth;
+        }
     }
 
     void leaveImpl(QueryTreeNodePtr & node)
     {
+        if (node->getNodeType() == QueryTreeNodeType::QUERY)
+        {
+            if (!query_node_stack.empty())
+                query_node_stack.pop_back();
+        }
+
         if (const auto * col_node = node->as<ColumnNode>(); col_node && col_node->hasExpression())
         {
-            --alias_depth;
+            auto src = col_node->getColumnSourceOrNull();
+            if (src && src->getNodeType() == QueryTreeNodeType::TABLE && alias_depth > 0)
+                --alias_depth;
             return;
         }
 
-        if (!getSettings()[Setting::optimize_use_materialized_columns])
+        if (!getSettings()[Setting::optimize_map_materialized_columns])
+            return;
+
+        if (!query_node_stack.empty() && precheck.skip_query_nodes.contains(query_node_stack.back()))
             return;
 
         const auto * fn = node->as<FunctionNode>();
@@ -144,55 +379,78 @@ public:
 
         auto column_source = map_col->getColumnSourceOrNull();
         const auto * table_node = column_source ? column_source->as<TableNode>() : nullptr;
-        if (!table_node)
+        if (!table_node || precheck.skip_tables.contains(table_node))
+            return;
+
+        TableColKey map_col_key{table_node, map_col->getColumnName()};
+        if (precheck.forbidden_cols.contains(map_col_key))
             return;
 
         auto it = table_maps.find(table_node);
         if (it == table_maps.end())
             it = table_maps.emplace(table_node, buildMaterializedMapForTable(*table_node)).first;
 
-        const auto & lookup = it->second;
-        if (lookup.empty())
+        const auto & per_col_lookup = it->second;
+        auto col_it = per_col_lookup.find(map_col->getColumnName());
+        if (col_it == per_col_lookup.end() || !col_it->second.key_type)
             return;
 
-        auto mat_it = lookup.find(MapKeyPair{map_col->getColumnName(), key_const->getValue()});
-        if (mat_it == lookup.end())
+        Field normalized_key = normalizeMapKeyField(key_const->getValue(), *col_it->second.key_type);
+        if (normalized_key.isNull())
             return;
 
-        const NameAndTypePair & mat_col = mat_it->second;
-        if (!mat_col.type->equals(*fn->getResultType()))
+        auto mat_it = col_it->second.by_key.find(MapKeyPair{map_col->getColumnName(), std::move(normalized_key)});
+        if (mat_it == col_it->second.by_key.end())
             return;
 
-        /// Outside an ALIAS column expression (and when RBAC is not delegated to an ALIAS column),
-        /// only substitute if the user holds SELECT access on the target MATERIALIZED column.
+        const bool whole_map_also_read = precheck.whole_map_read_cols.contains(map_col_key);
         const auto & delegated_access_col = map_col->getAccessCheckColumnName();
-        if (alias_depth == 0 && !delegated_access_col)
+        const bool skip_rbac_check = (alias_depth > 0 || delegated_access_col.has_value());
+        const auto & storage_id = table_node->getStorageID();
+
+        const MaterializedCandidate * chosen = nullptr;
+        for (const auto & candidate : mat_it->second)
         {
-            const auto & storage_id = table_node->getStorageID();
-            if (!getContext()->getAccess()->isGranted(
-                    AccessType::SELECT, storage_id.getDatabaseName(), storage_id.getTableName(), mat_col.name))
-                return;
+            if (whole_map_also_read && !candidate.is_in_primary_key)
+                continue;
+            if (!candidate.col.type->equals(*fn->getResultType()))
+                continue;
+            if (!skip_rbac_check
+                && !getContext()->getAccess()->isGranted(
+                    AccessType::SELECT, storage_id.getDatabaseName(), storage_id.getTableName(), candidate.col.name))
+                continue;
+            chosen = &candidate;
+            break;
         }
 
-        auto mat_node = std::make_shared<ColumnNode>(mat_col, column_source);
+        if (!chosen)
+            return;
+
+        auto mat_node = std::make_shared<ColumnNode>(chosen->col, column_source);
         if (delegated_access_col)
             mat_node->setAccessCheckColumnName(*delegated_access_col);
         node = std::move(mat_node);
     }
 
 private:
+    MaterializedPrecheckVisitor precheck;
     size_t alias_depth = 0;
-    UnorderedMapWithMemoryTracking<const TableNode *, MaterializedLookupMap> table_maps;
+    VectorWithMemoryTracking<const QueryNode *> query_node_stack;
+    UnorderedMapWithMemoryTracking<const TableNode *, UnorderedMapWithMemoryTracking<String, TableLookupInfo>> table_maps;
 };
 
 }
 
 void MaterializedColumnSubstitutionPass::run(QueryTreeNodePtr & query_tree_node, ContextPtr context)
 {
-    if (!context->getSettingsRef()[Setting::optimize_use_materialized_columns])
+    if (!context->getSettingsRef()[Setting::optimize_map_materialized_columns]
+        || context->canUseParallelReplicasOnInitiator())
         return;
 
-    MaterializedColumnSubstitutionVisitor visitor(std::move(context));
+    MaterializedPrecheckVisitor precheck(context);
+    precheck.visit(query_tree_node);
+
+    MaterializedColumnSubstitutionVisitor visitor(std::move(context), std::move(precheck));
     visitor.visit(query_tree_node);
 }
 
