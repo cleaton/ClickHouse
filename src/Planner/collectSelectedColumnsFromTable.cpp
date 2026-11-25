@@ -32,7 +32,7 @@ public:
             return;
 
         /// Note that arguments of the "indexHint" function need to be checked for SELECT privilege
-        selected_columns.insert(column_node->getColumnName());
+        selected_columns.insert(column_node->getAccessCheckColumnName().value_or(column_node->getColumnName()));
     }
 
     [[nodiscard]] bool isAliasColumn(const QueryTreeNodePtr & node) const

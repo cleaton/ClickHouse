@@ -1,0 +1,75 @@
+=== UC1a: merged map queries ===
+1	10	20	30		
+2				40	
+1	1	0	1
+2	0	0	0
+=== UC1a: dynamic key column ===
+1	bar	20	1
+1	baz		0
+1	foo	10	1
+2	bar		0
+2	baz		0
+2	foo		0
+=== UC1a: whole-map access still works ===
+1	{'bar':'20','foo':'10'}	{'foo':'30'}
+2	{}	{'baz':'40'}
+=== UC1a: verify mapApply/mapFilter pushed down ===
+1
+1
+=== UC1b: split map queries ===
+1	auth	200	t1	0	1	1
+2	pay		t2	0	1	1
+=== UC1b: verify unused map pruned ===
+1
+1
+=== UC2: initial materialized + masked query ===
+1	checkout	/pay		0
+4	checkout	/confirm		0
+=== UC2: verify __mat_service used without reading raw_attrs ===
+1
+1
+1
+=== UC2: add __mat_http_url WITHOUT changing attrs ALIAS ===
+1
+1
+1	/pay
+2	/login
+3	/find
+4	/confirm
+=== UC2: drop __mat_http_url falls back cleanly ===
+1	/pay
+2	/login
+3	/find
+4	/confirm
+=== UC2: type mismatch guard prevents silent breakage ===
+1	1
+2	1
+3	0
+4	0
+1	legacy_mem	
+=== Complex SQL: JOIN / PREWHERE / GROUP BY / VIEW / CTE / Lambda ===
+checkout	/pay	
+checkout	/confirm	
+auth	1
+checkout	2
+search	1
+1	right_svc	
+2	\N	
+3	\N	
+4	\N	
+1	checkout
+2	
+1	checkout
+2	auth
+1	shadow_val
+2	shadow_val
+3	shadow_val
+4	shadow_val
+1	['lambda_val']
+1	checkout	
+2	auth	
+1	checkout	
+2	auth	
+3	search	
+4	checkout	
+1	checkout

@@ -61,6 +61,9 @@ void ColumnNode::dumpTreeImpl(WriteBuffer & buffer, FormatState & state, size_t 
 
     buffer << ", column_name: " << column.name << ", result_type: " << column.type->getName();
 
+    if (access_check_column_name)
+        buffer << ", access_check_column: " << *access_check_column_name;
+
     auto column_source_ptr = source.lock();
     if (column_source_ptr)
         buffer << ", source_id: " << state.getNodeId(column_source_ptr.get());
@@ -77,7 +80,9 @@ void ColumnNode::dumpTreeImpl(WriteBuffer & buffer, FormatState & state, size_t 
 bool ColumnNode::isEqualImpl(const IQueryTreeNode & rhs, CompareOptions /*compare_options*/) const
 {
     const auto & rhs_typed = assert_cast<const ColumnNode &>(rhs);
-    return column.name == rhs_typed.column.name && column.type->equals(*rhs_typed.column.type);
+    return column.name == rhs_typed.column.name
+        && column.type->equals(*rhs_typed.column.type)
+        && access_check_column_name == rhs_typed.access_check_column_name;
 }
 
 void ColumnNode::updateTreeHashImpl(HashState & hash_state, CompareOptions /*compare_options*/) const
@@ -86,15 +91,28 @@ void ColumnNode::updateTreeHashImpl(HashState & hash_state, CompareOptions /*com
     hash_state.update(column.name);
 
     column.type->updateHash(hash_state);
+
+    const bool has_access_check_column = access_check_column_name.has_value();
+    hash_state.update(has_access_check_column);
+    if (has_access_check_column)
+    {
+        hash_state.update(access_check_column_name->size());
+        hash_state.update(*access_check_column_name);
+    }
 }
 
 QueryTreeNodePtr ColumnNode::cloneImpl() const
 {
-    return std::make_shared<ColumnNode>(column, source);
+    auto cloned = std::make_shared<ColumnNode>(column, source);
+    if (access_check_column_name)
+        cloned->setAccessCheckColumnName(*access_check_column_name);
+    return cloned;
 }
 
 ASTPtr ColumnNode::toASTImpl(const ConvertToASTOptions & options) const
 {
+    if (access_check_column_name.has_value() && hasExpression())
+        return getExpression()->toAST(options);
     std::vector<std::string> column_identifier_parts;
 
     auto column_source = getColumnSourceOrNull();

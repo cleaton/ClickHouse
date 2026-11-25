@@ -134,6 +134,18 @@ public:
         source = source_;
     }
 
+    /// Optional table column name whose SELECT privilege authorizes this column node
+    /// when a pass substitutes an ALIAS lookup with a pushed-down expression.
+    [[nodiscard]] const std::optional<String> & getAccessCheckColumnName() const
+    {
+        return access_check_column_name;
+    }
+
+    void setAccessCheckColumnName(String name)
+    {
+        access_check_column_name = std::move(name);
+    }
+
     [[nodiscard]] QueryTreeNodeType getNodeType() const override
     {
         return QueryTreeNodeType::COLUMN;
@@ -164,6 +176,7 @@ private:
 
     NameAndTypePair column;
     TableExpressionNodeWeakPtr source;
+    std::optional<String> access_check_column_name;
 
     static constexpr size_t expression_child_index = 0;
     static constexpr size_t children_size = expression_child_index + 1;

@@ -102,6 +102,7 @@ public:
         if (isAliasColumn(node))
         {
             /// Column is an ALIAS column with expression
+            const auto & access_check_col = column_node->getAccessCheckColumnName();
             bool column_already_exists = table_expression_data.hasColumn(column_node->getColumnName());
             if (!column_already_exists)
             {
@@ -114,6 +115,9 @@ public:
 
                 if (!keep_alias_columns)
                 {
+                    if (access_check_col && select_added_columns)
+                        table_expression_data.markColumnForAccessCheck(*access_check_col);
+
                     /// For PREWHERE we can just replace ALIAS column with it's expression,
                     /// because ActionsDAG for PREWHERE applied right on top of table expression
                     /// and cannot affect subqueries or other table expressions.
@@ -151,10 +155,41 @@ public:
                 alias_node = &alias_column_actions_dag.addAlias(*alias_node, column_name);
 
                 alias_column_actions_dag.getOutputs() = std::move(outputs);
-                table_expression_data.addAliasColumn(column_node->getColumn(), column_identifier, std::move(alias_column_actions_dag), select_added_columns);
+                if (access_check_col)
+                {
+                    /// Synthetic pushed-down ALIAS node checks SELECT on the underlying ALIAS column name rather than its generated name.
+                    table_expression_data.addAliasColumn(column_node->getColumn(), column_identifier, std::move(alias_column_actions_dag), false);
+                    if (select_added_columns)
+                        table_expression_data.markColumnForAccessCheck(*access_check_col);
+                }
+                else
+                {
+                    table_expression_data.addAliasColumn(column_node->getColumn(), column_identifier, std::move(alias_column_actions_dag), select_added_columns);
+                }
             }
             else
-                table_expression_data.markSelectedColumn(column_node->getColumn().name);
+            {
+                if (!keep_alias_columns)
+                {
+                    if (select_added_columns)
+                    {
+                        if (access_check_col)
+                            table_expression_data.markColumnForAccessCheck(*access_check_col);
+                        else
+                            table_expression_data.markSelectedColumn(column_node->getColumn().name);
+                    }
+                    node = column_node->getExpression();
+                    inlined_alias_expressions.insert(node.get());
+                    return;
+                }
+                if (select_added_columns)
+                {
+                    if (access_check_col)
+                        table_expression_data.markColumnForAccessCheck(*access_check_col);
+                    else
+                        table_expression_data.markSelectedColumn(column_node->getColumn().name);
+                }
+            }
 
             return;
         }
@@ -168,18 +203,33 @@ public:
                 "Expected table, table function, array join, query or union column source. Actual {}",
                 column_source_node->formatASTForErrorMessage());
 
+        const auto & access_check_col = column_node->getAccessCheckColumnName();
         bool column_already_exists = table_expression_data.hasColumn(column_node->getColumnName());
         if (column_already_exists)
         {
             /// Column may be added when we collected data for ALIAS column
             /// But now we see it directly in the query, so make sure it's marked as selected
             if (select_added_columns)
-                table_expression_data.markSelectedColumn(column_node->getColumnName());
+            {
+                if (access_check_col)
+                    table_expression_data.markColumnForAccessCheck(*access_check_col);
+                else
+                    table_expression_data.markSelectedColumn(column_node->getColumnName());
+            }
             return;
         }
 
         auto column_identifier = planner_context->getGlobalPlannerContext()->createColumnIdentifier(node);
-        table_expression_data.addColumn(column_node->getColumn(), column_identifier, select_added_columns);
+        if (access_check_col)
+        {
+            table_expression_data.addColumn(column_node->getColumn(), column_identifier, false);
+            if (select_added_columns)
+                table_expression_data.markColumnForAccessCheck(*access_check_col);
+        }
+        else
+        {
+            table_expression_data.addColumn(column_node->getColumn(), column_identifier, select_added_columns);
+        }
     }
 
     void leaveImpl(QueryTreeNodePtr & node)
