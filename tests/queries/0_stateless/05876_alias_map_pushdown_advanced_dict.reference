@@ -1,0 +1,25 @@
+=== A1. Array(String) denylist per user + EXPLAIN uses __mat_service ===
+1	checkout			alice@acme.com	0
+1
+0
+=== B1. Multi-action redaction modes (hash, email_mask, drop, redact, allow) ===
+1	checkout	39B051DF	***@acme.com		***		0
+2	auth	3B18D2E3	***@acme.com		***		0
+1	{'credit_card':'4111','email':'***@acme.com','http.url':'/pay','internal.host':'db-01','pii.phone':'555-0100','service':'checkout','ssn':'39B051DF','token':'***'}
+=== B2. Live dictionary action transition for email (email_mask -> hash -> drop) ===
+1	9932E29A
+2	C9837028
+1		0
+2		0
+=== C1. Nested lambda prefix denylist + live reload adding http. prefix ===
+1	checkout	/pay		
+2	auth	/login		
+1	{'credit_card':'4111','email':'alice@acme.com','http.url':'/pay','secret_note':'top_secret','service':'checkout','ssn':'111-11','token':'tok_123'}
+1	checkout	
+2	auth	
+=== C2. Nested lambda role-based dictionary + QueryResultCache non-leakage ===
+ACCESS_DENIED
+1	checkout	111-11	top_secret
+2	auth	222-22	hidden
+1	checkout		
+2	auth		

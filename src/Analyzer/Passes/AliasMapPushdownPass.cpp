@@ -374,27 +374,47 @@ QueryTreeNodePtr substituteAndFoldExpr(
     if (const auto * col_node = node->as<ColumnNode>())
     {
         auto src = col_node->getColumnSourceOrNull();
+        auto make_cast_if_needed = [&](QueryTreeNodePtr rep)
+        {
+            if (rep && !rep->getResultType()->equals(*col_node->getColumnType()))
+                rep = tryFoldResolvedFunction(buildCastFunction(rep, col_node->getColumnType(), context, true));
+            return rep;
+        };
         if (k_replacement && src && src.get() == k_source && col_node->getColumnName() == k_name)
-            return k_replacement->clone();
+            return make_cast_if_needed(k_replacement->clone());
         if (v_replacement && src && src.get() == v_source && col_node->getColumnName() == v_name)
-            return v_replacement->clone();
+            return make_cast_if_needed(v_replacement->clone());
         return node->clone();
     }
 
     QueryTreeNodePtr cloned = node->clone();
-    if (cloned->getNodeType() == QueryTreeNodeType::LAMBDA)
+    if (auto * inner_lambda = cloned->as<LambdaNode>())
+    {
+        if (inner_lambda->getExpression())
+        {
+            const auto orig_type = inner_lambda->getExpression()->getResultType();
+            QueryTreeNodePtr new_expr = substituteAndFoldExpr(
+                inner_lambda->getExpression(), k_source, k_name, k_replacement, v_source, v_name, v_replacement, context);
+            if (orig_type && new_expr && !new_expr->getResultType()->equals(*orig_type))
+                new_expr = tryFoldResolvedFunction(buildCastFunction(new_expr, orig_type, context, true));
+            inner_lambda->getExpression() = std::move(new_expr);
+        }
         return cloned;
+    }
 
     if (auto * fn = cloned->as<FunctionNode>())
     {
         auto & args = fn->getArguments().getNodes();
+        bool has_lambda_arg = false;
         for (auto & arg : args)
         {
+            if (arg && arg->getNodeType() == QueryTreeNodeType::LAMBDA)
+                has_lambda_arg = true;
             arg = substituteAndFoldExpr(
                 arg, k_source, k_name, k_replacement, v_source, v_name, v_replacement, context);
         }
 
-        if (fn->isResolved() && fn->isOrdinaryCall())
+        if (fn->isResolved() && fn->isOrdinaryCall() && !has_lambda_arg)
         {
             if (fn->getFunctionName() != "in" && fn->getFunctionName() != "notIn")
             {
